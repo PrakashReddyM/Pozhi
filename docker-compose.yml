@@ -1,0 +1,59 @@
+# ==========================================
+# LOCAL DEVELOPMENT SERVICES
+#
+# Replaces the two pieces of infrastructure we were renting from Supabase and
+# never had locally: a PostgreSQL server and a Redis instance.
+#
+#   docker compose up -d        start both
+#   docker compose down         stop (data survives)
+#   docker compose down -v      stop and WIPE the database
+#
+# These credentials are for local development only. Nothing here is reachable
+# from outside your machine, and none of it belongs in production.
+# ==========================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pozhi-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pozhi
+      POSTGRES_PASSWORD: pozhi_local_dev
+      POSTGRES_DB: pozhi
+      # Matches the collation the app's text comparisons assume.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    ports:
+      # Host 5432 -> container 5432. If something already owns 5432 on your
+      # machine, change the left-hand number and your DATABASE_URL to match.
+      - "5432:5432"
+    volumes:
+      - pozhi_pgdata:/var/lib/postgresql/data
+      # Every .sql here runs once, in filename order, when the volume is first
+      # created. To re-run them after a schema change: docker compose down -v
+      - ./backend/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pozhi -d pozhi"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: pozhi-redis
+    restart: unless-stopped
+    # Without this the rate limiters fall back to an in-memory stub that lets
+    # every request through — see backend/src/services/cache.service.ts.
+    ports:
+      - "6379:6379"
+    volumes:
+      - pozhi_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pozhi_pgdata:
+  pozhi_redisdata:

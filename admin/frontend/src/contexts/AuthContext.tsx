@@ -1,0 +1,284 @@
+import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
+import { startAuthentication } from '@simplewebauthn/browser';
+import { supabase } from '@/config/supabase';
+import {
+  login as apiLogin,
+  signup as apiSignup,
+  logout as apiLogout,
+  getCurrentUser,
+  refreshToken as apiRefreshToken,
+  getPasskeyLoginOptions,
+  verifyPasskeyLogin,
+  loginWithGoogle as apiLoginWithGoogle,
+  exchangeCodeForGoogleSession as apiExchangeCodeForGoogleSession,
+  type AuthUser,
+  type AuthSession,
+} from '@/services/api';
+
+// ==========================================
+// TYPES
+// ==========================================
+
+interface AuthContextType {
+  user: AuthUser | null;
+  isLoading: boolean;
+  isAuthenticated: boolean;
+  login: (email: string, password: string) => Promise<void>;
+  loginWithGoogle: (redirectTo?: string) => Promise<string>;
+  completeGoogleLogin: (code: string) => Promise<void>;
+  completeGoogleLoginWithHash: (hash: string) => Promise<void>;
+  loginWithPasskey: (email?: string) => Promise<void>;
+  signup: (data: { email: string; password: string; full_name: string; phone?: string }) => Promise<void>;
+  logout: () => Promise<void>;
+}
+
+// ==========================================
+// CONTEXT
+// ==========================================
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+// ==========================================
+// TOKEN MANAGEMENT
+// ==========================================
+
+function storeSession(session: AuthSession) {
+  localStorage.setItem('access_token', session.access_token);
+  localStorage.setItem('refresh_token', session.refresh_token);
+  localStorage.setItem('expires_at', String(session.expires_at));
+}
+
+function clearSession() {
+  localStorage.removeItem('access_token');
+  localStorage.removeItem('refresh_token');
+  localStorage.removeItem('expires_at');
+}
+
+function getStoredRefreshToken(): string | null {
+  return localStorage.getItem('refresh_token');
+}
+
+function getTokenExpiresAt(): number {
+  return Number(localStorage.getItem('expires_at') || '0');
+}
+
+// ==========================================
+// PROVIDER
+// ==========================================
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  const isAuthenticated = !!user;
+
+  // Check existing session on mount
+  useEffect(() => {
+    let mounted = true;
+
+    async function checkAuth() {
+      const token = localStorage.getItem('access_token');
+      if (!token) {
+        if (mounted) setIsLoading(false);
+        return;
+      }
+
+      try {
+        // Check if token is about to expire (within 5 minutes)
+        const expiresAt = getTokenExpiresAt();
+        const fiveMinutes = 5 * 60;
+        const now = Math.floor(Date.now() / 1000);
+
+        if (expiresAt > 0 && expiresAt - now < fiveMinutes) {
+          const rt = getStoredRefreshToken();
+          if (rt) {
+            const { session } = await apiRefreshToken(rt);
+            storeSession(session);
+          }
+        }
+
+        const { user: currentUser } = await getCurrentUser();
+        if (mounted) setUser(currentUser);
+      } catch (error) {
+        console.error("Session restoration failed:", error);
+        // Only clear if it's a 401 (Unauthorized) or 403 (Forbidden)
+        // If it's a network error or 500, KEEP the token to retry later
+        if (error instanceof Error && (error.message.includes('401') || error.message.includes('403'))) {
+          // 🔄 AUTO-HEAL: If access token is expired, try to refresh it using the Refresh Token
+          try {
+            console.log("Access token expired, attempting to refresh...");
+            const rt = getStoredRefreshToken();
+            if (rt) {
+              const { session } = await apiRefreshToken(rt);
+              storeSession(session);
+
+              // Retry getting the user with the new token
+              const { user: currentUser } = await getCurrentUser();
+              if (mounted) setUser(currentUser);
+              return; // Success!
+            }
+          } catch (refreshError) {
+            console.error("Auto-heal failed:", refreshError);
+            // If refresh also fails, THEN log out
+            clearSession();
+            if (mounted) setUser(null);
+          }
+
+          // If no RT or refresh failed (already handled in catch above logic fallback)
+          if (!getStoredRefreshToken()) {
+            clearSession();
+            if (mounted) setUser(null);
+          }
+        }
+        // Otherwise, keep the token but maybe set user to null temporarily or show error state
+      } finally {
+        if (mounted) setIsLoading(false);
+      }
+    }
+
+    checkAuth();
+    return () => { mounted = false; };
+  }, []);
+
+  // Set up token refresh interval
+  useEffect(() => {
+    if (!user) return;
+
+    const interval = setInterval(async () => {
+      const rt = getStoredRefreshToken();
+      const expiresAt = getTokenExpiresAt();
+      const now = Math.floor(Date.now() / 1000);
+
+      // Refresh if within 5 minutes of expiry
+      if (rt && expiresAt > 0 && expiresAt - now < 300) {
+        try {
+          const { session } = await apiRefreshToken(rt);
+          storeSession(session);
+        } catch {
+          clearSession();
+          setUser(null);
+        }
+      }
+    }, 60_000); // Check every minute
+
+    return () => clearInterval(interval);
+  }, [user]);
+
+  const login = useCallback(async (email: string, password: string) => {
+    const { user: loggedInUser, session } = await apiLogin(email, password);
+    storeSession(session);
+    setUser(loggedInUser);
+  }, []);
+const loginWithGoogle = useCallback(async (redirectTo?: string) => {
+  // We initiate the OAuth flow from the frontend so that Supabase can set the
+  // required state/PKCE cookies in the browser. This fixes "bad_oauth_state"
+  // and avoids the backend's hardcoded localhost:3000 redirect defaults.
+  const { data, error } = await supabase.auth.signInWithOAuth({
+    provider: 'google',
+    options: {
+      redirectTo: redirectTo || `${window.location.origin}/login`,
+      queryParams: {
+        access_type: 'offline',
+        prompt: 'consent',
+      },
+    },
+  });
+
+  if (error) throw error;
+  return data.url || '';
+}, []);
+
+  const completeGoogleLogin = useCallback(async (code: string) => {
+    const { user: loggedInUser, session } = await apiExchangeCodeForGoogleSession(code);
+    
+    if (loggedInUser.role !== 'admin') {
+      throw new Error("Admin access required.");
+    }
+
+    storeSession(session);
+    setUser(loggedInUser);
+  }, []);
+
+  const completeGoogleLoginWithHash = useCallback(async (hash: string) => {
+    const params = new URLSearchParams(hash.replace('#', '?'));
+    const access_token = params.get('access_token');
+    const refresh_token = params.get('refresh_token');
+    const expires_in = params.get('expires_in');
+
+    if (!access_token || !refresh_token) {
+      throw new Error("Invalid login URL parameters");
+    }
+
+    const expires_at = Math.floor(Date.now() / 1000) + Number(expires_in || 3600);
+
+    storeSession({ access_token, refresh_token, expires_at });
+
+    try {
+      const { user: currentUser } = await getCurrentUser();
+      if (currentUser.role !== 'admin') {
+        clearSession();
+        setUser(null);
+        throw new Error("Admin access required.");
+      }
+      setUser(currentUser);
+    } catch (err: any) {
+      clearSession();
+      setUser(null);
+      throw new Error(err.message || "Authentication failed.");
+    }
+  }, []);
+
+  const loginWithPasskey = useCallback(async (email?: string) => {
+    const { options, challengeId } = await getPasskeyLoginOptions(email);
+    const credential = await startAuthentication({ optionsJSON: options });
+    const { user: loggedInUser, session } = await verifyPasskeyLogin(challengeId, credential);
+    storeSession(session);
+    setUser(loggedInUser);
+  }, []);
+
+  const signup = useCallback(async (data: { email: string; password: string; full_name: string; phone?: string }) => {
+    await apiSignup(data);
+    // After signup, auto-login
+    const { user: loggedInUser, session } = await apiLogin(data.email, data.password);
+    storeSession(session);
+    setUser(loggedInUser);
+  }, []);
+
+  const logout = useCallback(async () => {
+    try {
+      await apiLogout();
+    } finally {
+      clearSession();
+      setUser(null);
+    }
+  }, []);
+
+  return (
+    <AuthContext.Provider value={{ 
+      user, 
+      isLoading, 
+      isAuthenticated, 
+      login, 
+      loginWithGoogle,
+      completeGoogleLogin,
+      completeGoogleLoginWithHash,
+      loginWithPasskey, 
+      signup, 
+      logout 
+    }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+// ==========================================
+// HOOK
+// ==========================================
+
+export function useAuth() {
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+}

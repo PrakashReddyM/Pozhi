@@ -1,0 +1,49 @@
+# System files
+ntuser.i
+ntuser.dat
+ntuser.dat.log
+ntuser.ini
+nul
+Thumbs.db
+.DS_Store
+
+# Dependencies
+node_modules/
+jspm_packages/
+
+# Build outputs
+dist/
+build/
+out/
+.next/
+.vercel/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+backend/logs/
+
+# Secrets
+.env
+*.env
+**/*.env
+.env.local
+.env.*.local
+
+# Database / Auth Temp
+.wwebjs_auth/
+**/.wwebjs_auth/
+.supabase/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+ehthumbs.db
+Icon?

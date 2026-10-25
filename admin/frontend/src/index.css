@@ -1,0 +1,123 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Manrope:wght@400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 0 0% 10%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 10%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 10%;
+
+    --primary: 220 100% 40%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 210 20% 97%;
+    --secondary-foreground: 0 0% 10%;
+
+    --muted: 210 20% 97%;
+    --muted-foreground: 0 0% 29%;
+
+    --accent: 220 100% 96%;
+    --accent-foreground: 220 100% 40%;
+
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 0 0% 90%;
+    --input: 0 0% 90%;
+    --ring: 220 100% 40%;
+
+    --radius: 0.75rem;
+
+    /* Custom Pozhi tokens */
+    --surface: 210 17% 98%;
+    --heading: 0 0% 10%;
+    --body: 0 0% 29%;
+    --logo-black: 0 0% 10%;
+    --logo-blue: 220 100% 40%;
+    --glow: 220 100% 40%;
+
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 240 5.3% 26.1%;
+    --sidebar-primary: 240 5.9% 10%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 240 4.8% 95.9%;
+    --sidebar-accent-foreground: 240 5.9% 10%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'Inter', sans-serif;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'Manrope', sans-serif;
+    color: hsl(var(--heading));
+  }
+
+  p {
+    color: hsl(var(--body));
+  }
+}
+
+@layer utilities {
+  .text-heading {
+    color: hsl(var(--heading));
+  }
+
+  .text-body {
+    color: hsl(var(--body));
+  }
+
+  .bg-surface {
+    background-color: hsl(var(--surface));
+  }
+
+  .glass {
+    backdrop-filter: blur(20px) saturate(180%);
+    background-color: hsla(0, 0%, 100%, 0.8);
+    border-bottom: 1px solid hsl(var(--border));
+  }
+
+  .card-shadow {
+    box-shadow: 0 4px 40px -12px hsla(220, 100%, 40%, 0.08),
+                0 8px 24px -8px hsla(0, 0%, 0%, 0.04);
+  }
+
+  .card-shadow-hover {
+    box-shadow: 0 12px 48px -8px hsla(220, 100%, 40%, 0.15),
+                0 16px 32px -12px hsla(0, 0%, 0%, 0.06);
+  }
+
+  /* Radar ring animation for Snap n' Print */
+  .radar-ring {
+    animation: radar-pulse 3.2s ease-out infinite;
+    opacity: 0;
+  }
+
+  @keyframes radar-pulse {
+    0% {
+      transform: scale(0.4);
+      opacity: 0.6;
+    }
+    100% {
+      transform: scale(1);
+      opacity: 0;
+    }
+  }
+}
