@@ -2,7 +2,8 @@
 import Razorpay from 'razorpay';
 import crypto from 'crypto';
 import { env } from '../config/env';
-import { supabaseAdmin } from '../config/supabase';
+import { and, eq } from 'drizzle-orm';
+import { db, schema } from '../db';
 import { logger } from '../utils/logger';
 
 function getRazorpayInstance(): Razorpay {
@@ -23,38 +24,48 @@ export interface CreatePaymentOrderResult {
 }
 
 export async function createPaymentOrder(orderId: string, userId: string): Promise<CreatePaymentOrderResult> {
-  const { data: order, error } = await supabaseAdmin
-    .from('orders')
-    .select('id, total_amount, order_number, payment_status')
-    .eq('id', orderId)
-    .eq('user_id', userId)
-    .single();
+  // Scoped to the caller: without the user_id predicate any signed-in user
+  // could start a payment against someone else's order.
+  const [order] = await db
+    .select({
+      id: schema.orders.id,
+      totalAmount: schema.orders.totalAmount,
+      orderNumber: schema.orders.orderNumber,
+      paymentStatus: schema.orders.paymentStatus
+    })
+    .from(schema.orders)
+    .where(and(eq(schema.orders.id, orderId), eq(schema.orders.userId, userId)))
+    .limit(1);
 
-  if (error || !order) {
+  if (!order) {
     throw new Error('Order not found');
   }
-  if (order.payment_status === 'completed') {
+  if (order.paymentStatus === 'completed') {
     throw new Error('Order is already paid');
   }
 
   const razorpay = getRazorpayInstance();
-  const amountInPaise = Math.round(order.total_amount * 100);
+
+  // numeric(10,2) arrives as a string from pg, so parse it rather than relying
+  // on JavaScript coercing "179.00" * 100.
+  const amountInPaise = Math.round(parseFloat(order.totalAmount) * 100);
 
   const rzpOrder = await razorpay.orders.create({
     amount: amountInPaise,
     currency: 'INR',
-    receipt: order.order_number,
+    receipt: order.orderNumber,
     notes: {
       orderId,
-      orderNumber: order.order_number,
+      orderNumber: order.orderNumber,
     },
   });
 
-  // Store razorpay order ID against our order
-  await supabaseAdmin
-    .from('orders')
-    .update({ upi_transaction_id: rzpOrder.id })
-    .eq('id', orderId);
+  // Store razorpay order ID against our order. verifyPayment reads it back to
+  // prove the payment belongs to this order.
+  await db
+    .update(schema.orders)
+    .set({ upiTransactionId: rzpOrder.id })
+    .where(eq(schema.orders.id, orderId));
 
   logger.info('Razorpay order created', { orderId, razorpayOrderId: rzpOrder.id });
 
@@ -84,18 +95,23 @@ export async function handlePaymentSuccess(
   orderId: string,
   razorpayPaymentId: string,
 ): Promise<void> {
-  const { error } = await supabaseAdmin
-    .from('orders')
-    .update({
-      payment_status: 'completed',
-      order_status: 'confirmed',
-      payment_method: 'razorpay',
-      upi_transaction_id: razorpayPaymentId,
+  const updated = await db
+    .update(schema.orders)
+    .set({
+      paymentStatus: 'completed',
+      orderStatus: 'confirmed',
+      paymentMethod: 'razorpay',
+      // Overwrites the Razorpay order id stored above; preserved from the
+      // pre-migration behaviour, and verifyPayment has already read it.
+      upiTransactionId: razorpayPaymentId
+      // updated_at maintained by trigger trg_orders_updated_at.
     })
-    .eq('id', orderId);
+    .where(eq(schema.orders.id, orderId))
+    .returning({ id: schema.orders.id });
 
-  if (error) {
-    logger.error('Failed to update order after payment', { orderId, error });
+  // A silent no-op here would mean a paid order left marked pending.
+  if (updated.length === 0) {
+    logger.error('Failed to update order after payment: no such order', { orderId });
     throw new Error('Failed to update order status');
   }
 

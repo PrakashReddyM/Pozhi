@@ -18,10 +18,8 @@ import { env } from './config/env';
 import orderRoutes from './api/orders/orders.routes';
 import paymentRoutes from './api/payments/payment.routes';
 import uploadRoutes from './api/upload/upload.routes';
-import productRoutes from './api/products/products.routes';
 import { errorHandler } from './middleware/errorHandler.middleware';
 import { logger } from './utils/logger';
-import cartRoutes from './api/cart/cart.routes';
 import userRoutes from './api/users/users.routes';
 import authRoutes from './api/auth/auth.routes';
 import pricingRoutes from './api/pricing/pricing.routes';
@@ -202,11 +200,9 @@ app.get('/health', async (req: Request, res: Response) => {
 // 🛤️ API ROUTES (FIXED - No Duplicates!)
 // ==========================================
 
-app.use('/api/v1/products', productRoutes);
 app.use('/api/v1/orders', orderRoutes);
 app.use('/api/v1/payments', paymentRoutes);
 app.use('/api/v1/upload', uploadRoutes);
-app.use('/api/v1/cart', cartRoutes);
 app.use('/api/v1/users', userRoutes);
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/pricing', pricingRoutes); // Public pricing endpoints
@@ -221,10 +217,13 @@ app.use('*', (req: Request, res: Response) => {
     status: 'error',
     message: `Route ${req.originalUrl} not found`,
     availableRoutes: [
-      '/api/v1/products',
+      '/api/v1/auth',
       '/api/v1/orders',
       '/api/v1/payments',
-      '/api/v1/upload'
+      '/api/v1/upload',
+      '/api/v1/users',
+      '/api/v1/pricing',
+      '/api/v1/geo'
     ]
   });
 });

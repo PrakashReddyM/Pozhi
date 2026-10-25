@@ -1,6 +1,5 @@
 import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
 import { startAuthentication } from '@simplewebauthn/browser';
-import { supabase } from '@/config/supabase';
 import {
   login as apiLogin,
   signup as apiSignup,
@@ -149,23 +148,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(loggedInUser);
   }, []);
 const loginWithGoogle = useCallback(async (redirectTo?: string) => {
-  // We initiate the OAuth flow from the frontend so that Supabase can set the
-  // required state/PKCE cookies in the browser. This fixes "bad_oauth_state"
-  // and avoids the backend's hardcoded localhost:3000 redirect defaults.
-  const { data, error } = await supabase.auth.signInWithOAuth({
-    provider: 'google',
-    options: {
-      redirectTo: redirectTo || `${window.location.origin}/account`,
-      queryParams: {
-        access_type: 'offline',
-        prompt: 'consent',
-      },
-    },
-  });
-
-  if (error) throw error;
-  return data.url || '';
-}, []);
+    // The backend builds the Google OAuth URL with a signed CSRF state parameter
+    // and returns it. We just redirect the browser there.
+    const { url } = await apiLoginWithGoogle(redirectTo);
+    return url;
+  }, []);
 
   const completeGoogleLogin = useCallback(async (code: string) => {
     const { user: loggedInUser, session } = await apiExchangeCodeForGoogleSession(code);

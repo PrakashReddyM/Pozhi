@@ -2,17 +2,17 @@
 import app from './app';
 import { env } from './config/env';
 import { logger } from './utils/logger';
-import { testSupabaseConnection } from './config/supabase';
+import { testDatabaseConnection } from './db';
 
 // Helper to start server
 const startServer = async () => {
   try {
-    // Test database connection
-    // const isDbConnected = await testSupabaseConnection();
-    // if (!isDbConnected) {
-    //   logger.error('Database connection failed. Exiting...');
-    //   process.exit(1);
-    // }
+    // Verify PostgreSQL is reachable before accepting traffic.
+    const isDbConnected = await testDatabaseConnection();
+    if (!isDbConnected) {
+      logger.error('Database connection failed. Exiting...');
+      process.exit(1);
+    }
 
     const PORT = env.PORT || 5000;
 

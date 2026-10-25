@@ -2,7 +2,7 @@
 // SECURITY LOGGER - PRODUCTION READY
 // ==========================================
 
-import { supabaseAdmin } from '../config/supabase';
+import { db, schema } from '../db';
 import { logger } from './logger';
 
 // ==========================================
@@ -54,28 +54,21 @@ export interface SecurityEvent {
  */
 export async function logSecurityEvent(event: SecurityEvent): Promise<void> {
   try {
-    const { error } = await supabaseAdmin
-      .from('security_events')
-      .insert({
-        event_type: event.type,
-        user_id: event.user_id || null,
-        ip_address: event.ip,
-        user_agent: event.user_agent,
-        details: event.details,
-        // ✅ Insert the new fields (with defaults)
-        severity: event.severity || 'low',
-        blocked: event.blocked || false,
-        created_at: new Date().toISOString()
-      });
-
-    if (error) {
-      logger.error('Failed to log security event', {
-        error: error.message,
-        eventType: event.type
-      });
-    }
-
+    await db.insert(schema.securityEvents).values({
+      eventType: event.type,
+      // A security event is worth keeping even if the user row is gone, so
+      // the column is nullable and set null rather than omitted.
+      userId: event.user_id || null,
+      ipAddress: event.ip,
+      userAgent: event.user_agent,
+      details: event.details,
+      severity: event.severity || 'low',
+      blocked: event.blocked || false
+      // created_at defaults to now() in the database.
+    });
   } catch (error: any) {
+    // Never let audit logging break the request it is describing.
+
     logger.error('Security event logging error', {
       error: error.message,
       eventType: event.type

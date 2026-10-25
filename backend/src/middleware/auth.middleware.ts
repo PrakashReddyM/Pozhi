@@ -6,10 +6,35 @@
 // ==========================================
 
 import { Request, Response, NextFunction } from 'express';
-import { supabase, supabaseAdmin } from '../config/supabase';
+import { eq } from 'drizzle-orm';
+import { db, schema } from '../db';
+import { verifyAccessToken } from '../services/token.service';
 import { ApiError } from '../utils/ApiError';
 import { logger } from '../utils/logger';
 import { logSecurityEvent } from '../utils/securityLogger';
+
+/**
+ * Look up the live account state for a token's subject.
+ *
+ * The access token already carries id/email/role, but role and ban status are
+ * re-read on every request so that banning a user, or demoting an admin, takes
+ * effect immediately instead of waiting for their token to expire.
+ */
+async function loadAccount(userId: string) {
+  const [profile] = await db
+    .select({
+      id: schema.profiles.id,
+      email: schema.profiles.email,
+      role: schema.profiles.role,
+      isBanned: schema.profiles.isBanned,
+      isActive: schema.profiles.isActive
+    })
+    .from(schema.profiles)
+    .where(eq(schema.profiles.id, userId))
+    .limit(1);
+
+  return profile ?? null;
+}
 
 // ==========================================
 // TYPESCRIPT DEFINITIONS
@@ -46,11 +71,11 @@ export const optionalAuth = async (
 
     const token = authHeader.split(' ')[1];
 
-    // Verify token with Supabase
-    const { data: { user }, error } = await supabase.auth.getUser(token);
-
-    if (error) {
-      // ✅ LOG THE ERROR (Don't silently fail!)
+    // Verify locally against our own signing key - no network call.
+    let payload;
+    try {
+      payload = verifyAccessToken(token);
+    } catch (error: any) {
       logger.warn('Optional auth failed:', {
         error: error.message,
         ip: req.ip,
@@ -61,22 +86,21 @@ export const optionalAuth = async (
       return next();
     }
 
-    if (!user) {
+    const profile = await loadAccount(payload.sub);
+
+    // Token signed for a user who no longer exists.
+    if (!profile) {
+      logger.warn('Optional auth: token subject has no profile', {
+        userId: payload.sub,
+        ip: req.ip
+      });
       return next();
     }
 
-    // Get user profile
-    const { data: profile, error: profileError } = await supabaseAdmin
-      .from('profiles')
-      .select('role, is_banned')
-      .eq('id', user.id)
-      .limit(1)
-      .maybeSingle();
+    const user = { id: profile.id, email: profile.email };
 
-    if (profileError) {
-      // ✅ LOG DATABASE ERRORS
-      logger.error('Failed to fetch user profile:', {
-        error: profileError.message,
+    if (profile.isActive === false) {
+      logger.warn('Inactive account attempted access', {
         userId: user.id,
         ip: req.ip
       });
@@ -84,7 +108,7 @@ export const optionalAuth = async (
     }
 
     // ✅ CHECK IF BANNED (Even in optional auth!)
-    if (profile?.is_banned) {
+    if (profile.isBanned) {
       // ✅ LOG BANNED USER ATTEMPT
       await logSecurityEvent({
         type: 'unauthorized_access',
@@ -113,7 +137,7 @@ export const optionalAuth = async (
     req.user = {
       id: user.id,
       email: user.email || '',
-      role: profile?.role || 'customer'
+      role: profile.role || 'customer'
     };
 
     next();
@@ -130,7 +154,7 @@ export const optionalAuth = async (
     // ⚠️ Alert admin about system issues
     if (error.message.includes('ECONNREFUSED') ||
       error.message.includes('timeout')) {
-      logger.error('🚨 CRITICAL: Supabase connection issue!', {
+      logger.error('CRITICAL: PostgreSQL connection issue!', {
         error: error.message,
         timestamp: new Date().toISOString()
       });
@@ -174,65 +198,53 @@ export const requireAuth = async (
 
     const token = authHeader.split(' ')[1];
 
-    // ✅ VERIFY TOKEN WITH SUPABASE
-    const { data: { user }, error } = await supabase.auth.getUser(token);
-
-    if (error) {
-      // ✅ DIFFERENTIATE TOKEN ERRORS
-      const isExpired = error.message.toLowerCase().includes('expired');
-      const errorMessage = isExpired
-        ? 'Token has expired. Please login again.'
-        : 'Invalid authentication token';
-
-      // ✅ LOG INVALID TOKEN ATTEMPT
+    // ✅ VERIFY TOKEN (locally, against our own signing key)
+    // verifyAccessToken already distinguishes expired from malformed, which
+    // the frontend needs: it refreshes on the former, signs out on the latter.
+    let payload;
+    try {
+      payload = verifyAccessToken(token);
+    } catch (error: any) {
       await logSecurityEvent({
         type: 'unauthorized_access',
         user_id: undefined,
         ip: req.ip || 'unknown',
         user_agent: req.get('user-agent') || 'unknown',
         details: {
-          reason: isExpired ? 'Expired token' : 'Invalid token',
-          error: error.message,
+          reason: error.message,
           path: req.path,
           method: req.method
         }
       });
 
       logger.warn('Authentication failed:', {
-        reason: isExpired ? 'expired' : 'invalid',
-        error: error.message,
+        reason: error.message,
         ip: req.ip,
         path: req.path
       });
 
-      throw new ApiError(401, errorMessage);
+      throw error;
     }
 
-    if (!user) {
+    const profile = await loadAccount(payload.sub);
+
+    // A validly signed token for a deleted account must not authenticate.
+    if (!profile) {
+      logger.warn('Auth rejected: token subject has no profile', {
+        userId: payload.sub,
+        ip: req.ip
+      });
       throw new ApiError(401, 'Authentication failed');
     }
 
-    // ✅ GET USER PROFILE
-    const { data: profile, error: profileError } = await supabaseAdmin
-      .from('profiles')
-      .select('role, is_banned')
-      .eq('id', user.id)
-      .limit(1)
-      .maybeSingle();
-
-    if (profileError) {
-      // ✅ LOG DATABASE ERROR
-      logger.error('Failed to fetch user profile:', {
-        error: profileError.message,
-        userId: user.id,
-        ip: req.ip
-      });
-
-      throw new ApiError(500, 'Failed to verify user account');
+    if (profile.isActive === false) {
+      throw new ApiError(403, 'Your account is inactive. Contact support for assistance.');
     }
 
+    const user = { id: profile.id, email: profile.email };
+
     // ✅ CHECK IF BANNED
-    if (profile?.is_banned) {
+    if (profile.isBanned) {
       // ✅ LOG BANNED USER ATTEMPT
       await logSecurityEvent({
         type: 'unauthorized_access',
@@ -262,7 +274,7 @@ export const requireAuth = async (
     req.user = {
       id: user.id,
       email: user.email || '',
-      role: profile?.role || 'customer'
+      role: profile.role || 'customer'
     };
 
     // ✅ LOG SUCCESSFUL AUTH (Optional, enable for high-security needs)
@@ -283,7 +295,7 @@ export const requireAuth = async (
       // ⚠️ Alert on critical failures
       if (error.message.includes('ECONNREFUSED') ||
         error.message.includes('timeout')) {
-        logger.error('🚨 CRITICAL: Supabase connection issue!', {
+        logger.error('CRITICAL: PostgreSQL connection issue!', {
           error: error.message,
           timestamp: new Date().toISOString()
         });

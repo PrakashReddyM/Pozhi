@@ -1,16 +1,24 @@
 // ==========================================
 // UPLOAD CONTROLLER - POZHI SMART STORAGE
+//
+// All files are stored in Cloudflare R2.
+// (The original code had a Supabase Storage fallback for files < 10 MB;
+// that path has been removed during the self-hosted PostgreSQL migration.)
 // ==========================================
 
 import { Request, Response, NextFunction } from 'express';
-import { supabase, supabaseAdmin } from '../../config/supabase';
+import { and, desc, eq } from 'drizzle-orm';
+import { db, schema } from '../../db';
 import { env } from '../../config/env';
 import { ApiError } from '../../utils/ApiError';
 import { logger } from '../../utils/logger';
-import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+  GetObjectCommand
+} from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-
-const MB_10_IN_BYTES = 10 * 1024 * 1024; // 10MB threshold
 
 // Initialize S3 Client for Cloudflare R2
 const r2Client = new S3Client({
@@ -23,13 +31,10 @@ const r2Client = new S3Client({
 });
 
 /**
- * Upload files with SMART STORAGE LOGIC
- * - Single file < 10MB → Supabase
- * - Single file ≥ 10MB → Cloudflare R2
- * - Multiple files → Cloudflare R2
- * 
+ * Upload files to Cloudflare R2, then record each in user_uploads.
+ *
  * @route POST /api/v1/upload
- * @access Private (authenticated users only)
+ * @access Private
  */
 export const uploadFiles = async (
   req: Request,
@@ -38,85 +43,55 @@ export const uploadFiles = async (
 ) => {
   try {
     const userId = req.user?.id;
-    if (!userId) {
-      throw new ApiError(401, 'Authentication required');
-    }
+    if (!userId) throw new ApiError(401, 'Authentication required');
 
-    // Check if files exist (multer middleware should handle this)
     const files = req.files as any[];
-    if (!files || files.length === 0) {
-      throw new ApiError(400, 'No files uploaded');
-    }
+    if (!files || files.length === 0) throw new ApiError(400, 'No files uploaded');
 
     logger.info('Upload request', {
       userId,
       fileCount: files.length,
-      sizes: files.map(f => f.size)
+      sizes: files.map((f: any) => f.size)
     });
 
     const uploads: any[] = [];
 
-    // SMART LOGIC: Determine storage provider
-    let storageProvider: 'supabase' | 'cloudflare_r2';
-
-    if (files.length > 1) {
-      // Multiple files → Always Cloudflare R2
-      storageProvider = 'cloudflare_r2';
-    } else if (files[0].size >= MB_10_IN_BYTES) {
-      // Single large file → Cloudflare R2
-      storageProvider = 'cloudflare_r2';
-    } else {
-      // Single small file → Supabase
-      storageProvider = 'supabase';
-    }
-
-    logger.info('Storage provider selected', { storageProvider, fileCount: files.length });
-
-    // Process each file
     for (const file of files) {
-      let uploadResult;
+      const result = await uploadToCloudflareR2(file, userId);
 
-      if (storageProvider === 'supabase') {
-        uploadResult = await uploadToSupabase(file, userId);
-      } else {
-        uploadResult = await uploadToCloudflareR2(file, userId);
-      }
-
-      // Save to database
-      const { data: upload, error: dbError } = await supabaseAdmin
-        .from('user_uploads')
-        .insert({
-          user_id: userId,
-          storage_provider: storageProvider,
-          storage_url: uploadResult.url,
-          storage_path: uploadResult.path,
-          original_filename: file.originalname,
-          sanitized_filename: uploadResult.sanitizedFilename,
-          mime_type: file.mimetype,
-          file_size_bytes: file.size,
-          width: uploadResult.width,
-          height: uploadResult.height,
-          processing_status: 'completed'
+      const [upload] = await db
+        .insert(schema.userUploads)
+        .values({
+          userId,
+          storageProvider: 'cloudflare_r2',
+          storageUrl: result.url,
+          storagePath: result.path,
+          originalFilename: file.originalname,
+          sanitizedFilename: result.sanitizedFilename,
+          mimeType: file.mimetype,
+          fileSizeBytes: file.size,
+          width: result.width ?? null,
+          height: result.height ?? null,
+          processingStatus: 'completed'
         })
-        .select()
-        .single();
+        .returning();
 
-      if (dbError) {
-        logger.error('Failed to save upload to database', { error: dbError.message });
+      if (!upload) {
+        logger.error('Failed to save upload to database', { file: file.originalname });
         throw new ApiError(500, 'Failed to save upload metadata');
       }
 
       uploads.push({
         id: upload.id,
-        storage_provider: storageProvider,
-        storage_url: upload.storage_url,
-        file_size_bytes: upload.file_size_bytes,
-        original_filename: upload.original_filename
+        storage_provider: upload.storageProvider,
+        storage_url: upload.storageUrl,
+        file_size_bytes: upload.fileSizeBytes,
+        original_filename: upload.originalFilename
       });
 
       logger.info('File uploaded successfully', {
         uploadId: upload.id,
-        provider: storageProvider,
+        provider: 'cloudflare_r2',
         size: file.size
       });
     }
@@ -126,7 +101,7 @@ export const uploadFiles = async (
       message: `${files.length} file(s) uploaded successfully`,
       data: {
         uploads,
-        storage_provider: storageProvider
+        storage_provider: 'cloudflare_r2'
       }
     });
 
@@ -137,7 +112,8 @@ export const uploadFiles = async (
 };
 
 /**
- * Get user's uploads
+ * List the current user's uploads.
+ *
  * @route GET /api/v1/upload
  * @access Private
  */
@@ -148,29 +124,23 @@ export const getUserUploads = async (
 ) => {
   try {
     const userId = req.user?.id;
-    if (!userId) {
-      throw new ApiError(401, 'Authentication required');
-    }
+    if (!userId) throw new ApiError(401, 'Authentication required');
 
-    const limit = parseInt(req.query.limit as string) || 20;
-    const offset = parseInt(req.query.offset as string) || 0;
+    const limit  = Math.min(parseInt(req.query.limit  as string) || 20, 100);
+    const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
 
-    const { data: uploads, error } = await supabase
-      .from('user_uploads')
-      .select('*')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .range(offset, offset + limit - 1);
-
-    if (error) {
-      logger.error('Failed to fetch uploads', { error: error.message });
-      throw new ApiError(500, 'Failed to fetch uploads');
-    }
+    const uploads = await db
+      .select()
+      .from(schema.userUploads)
+      .where(eq(schema.userUploads.userId, userId))
+      .orderBy(desc(schema.userUploads.createdAt))
+      .limit(limit)
+      .offset(offset);
 
     res.status(200).json({
       success: true,
-      count: uploads?.length || 0,
-      data: uploads || []
+      count: uploads.length,
+      data: uploads
     });
 
   } catch (error) {
@@ -180,8 +150,12 @@ export const getUserUploads = async (
 };
 
 /**
- * View/Download an upload via redirect (Handles R2 presigned URLs)
+ * Redirect the caller to a short-lived R2 presigned URL for an upload.
+ * The upload is identified by its stored URL, not by a caller-supplied path,
+ * so this cannot be used as an open redirect or SSRF gadget.
+ *
  * @route GET /api/v1/upload/view-by-url
+ * @access Private
  */
 export async function viewUploadByUrl(
   req: Request,
@@ -189,53 +163,49 @@ export async function viewUploadByUrl(
   next: NextFunction
 ) {
   try {
+    const userId = req.user?.id;
+    if (!userId) throw new ApiError(401, 'Authentication required');
+
     const targetUrl = req.query.url as string;
     const isDownload = req.query.download === 'true';
-    const userId = req.user?.id;
 
-    if (!userId) {
-      throw new ApiError(401, 'Authentication required');
-    }
+    if (!targetUrl) throw new ApiError(400, 'Missing url query parameter');
 
-    if (!targetUrl) {
-      throw new ApiError(400, 'Missing url query parameter');
-    }
+    const [upload] = await db
+      .select()
+      .from(schema.userUploads)
+      .where(eq(schema.userUploads.storageUrl, targetUrl))
+      .limit(1);
 
-    // Resolve the upload by its stored URL. Everything we serve must correspond to a
-    // row we own a record of — we never fetch or redirect to a caller-supplied URL,
-    // which would make this an open redirect / SSRF gadget.
-    const { data: upload, error: fetchError } = await supabaseAdmin
-      .from('user_uploads')
-      .select('*')
-      .eq('storage_url', targetUrl)
-      .single();
+    if (!upload) throw new ApiError(404, 'Upload not found');
 
-    if (fetchError || !upload) {
-      throw new ApiError(404, 'Upload not found');
-    }
-
-    // These are customer photographs, including passport and visa images. Only the
-    // uploader or an admin fulfilling the order may view them.
-    if (upload.user_id !== userId && req.user?.role !== 'admin') {
+    // Customer photographs may include passport/visa images — only the uploader
+    // or an admin fulfilling the order may access them.
+    if (upload.userId !== userId && req.user?.role !== 'admin') {
       logger.warn('Blocked unauthorised upload access', { uploadId: upload.id, userId });
       throw new ApiError(404, 'Upload not found');
     }
 
     const command = new GetObjectCommand({
       Bucket: env.R2_BUCKET_NAME,
-      Key: upload.storage_path,
-      ResponseContentType: upload.mime_type || 'image/jpeg',
-      ResponseContentDisposition: isDownload ? `attachment; filename="${upload.original_filename || 'download.jpg'}"` : 'inline',
+      Key: upload.storagePath,
+      ResponseContentType: upload.mimeType || 'image/jpeg',
+      ResponseContentDisposition: isDownload
+        ? `attachment; filename="${upload.originalFilename || 'download.jpg'}"`
+        : 'inline'
     });
     const signedUrl = await getSignedUrl(r2Client, command, { expiresIn: 3600 });
+
     res.redirect(signedUrl);
+
   } catch (error) {
     next(error);
   }
 }
 
 /**
- * Delete an upload
+ * Delete an upload (from R2 and the DB row).
+ *
  * @route DELETE /api/v1/upload/:uploadId
  * @access Private
  */
@@ -246,45 +216,30 @@ export const deleteUpload = async (
 ) => {
   try {
     const userId = req.user?.id;
-    if (!userId) {
-      throw new ApiError(401, 'Authentication required');
-    }
+    if (!userId) throw new ApiError(401, 'Authentication required');
 
     const { uploadId } = req.params;
-    if (!uploadId) {
-      throw new ApiError(400, 'Upload ID is required');
-    }
+    if (!uploadId) throw new ApiError(400, 'Upload ID is required');
 
-    // Get upload details
-    const { data: upload, error: fetchError } = await supabase
-      .from('user_uploads')
-      .select('*')
-      .eq('id', uploadId)
-      .eq('user_id', userId)
-      .single();
+    const [upload] = await db
+      .select()
+      .from(schema.userUploads)
+      .where(and(
+        eq(schema.userUploads.id, uploadId),
+        eq(schema.userUploads.userId, userId)
+      ))
+      .limit(1);
 
-    if (fetchError || !upload) {
-      throw new ApiError(404, 'Upload not found');
-    }
+    if (!upload) throw new ApiError(404, 'Upload not found');
 
-    // Delete from storage
-    if (upload.storage_provider === 'supabase') {
-      await deleteFromSupabase(upload.storage_path);
-    } else {
-      await deleteFromCloudflareR2(upload.storage_path);
-    }
+    await deleteFromCloudflareR2(upload.storagePath);
 
-    // Delete from database
-    const { error: deleteError } = await supabase
-      .from('user_uploads')
-      .delete()
-      .eq('id', uploadId)
-      .eq('user_id', userId);
-
-    if (deleteError) {
-      logger.error('Failed to delete upload from database', { error: deleteError.message });
-      throw new ApiError(500, 'Failed to delete upload');
-    }
+    await db
+      .delete(schema.userUploads)
+      .where(and(
+        eq(schema.userUploads.id, uploadId),
+        eq(schema.userUploads.userId, userId)
+      ));
 
     logger.info('Upload deleted', { uploadId, userId });
 
@@ -300,128 +255,48 @@ export const deleteUpload = async (
 };
 
 // ==========================================
-// HELPER FUNCTIONS
+// HELPERS
 // ==========================================
 
-/**
- * Upload file to Supabase Storage
- */
-async function uploadToSupabase(file: any, userId: string) {
-  const sanitizedFilename = `${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
-  const filePath = `${userId}/${sanitizedFilename}`;
-
-  const { data, error } = await supabaseAdmin.storage
-    .from(env.SUPABASE_BUCKET)
-    .upload(filePath, file.buffer, {
-      contentType: file.mimetype,
-      upsert: false
-    });
-
-  if (error) {
-    logger.error('Supabase upload failed', { error: error.message });
-    throw new ApiError(500, 'Failed to upload to Supabase');
-  }
-
-  // Get public URL
-  const { data: urlData } = supabaseAdmin.storage
-    .from(env.SUPABASE_BUCKET)
-    .getPublicUrl(filePath);
-
-  // Get image dimensions if it's an image
-  let width, height;
-  if (file.mimetype.startsWith('image/')) {
-    // Placeholder - implement with sharp or similar
-    width = null;
-    height = null;
-  }
-
-  return {
-    url: urlData.publicUrl,
-    path: filePath,
-    sanitizedFilename,
-    width,
-    height
-  };
-}
-
-/**
- * Upload file to Cloudflare R2
- */
 async function uploadToCloudflareR2(file: any, userId: string) {
   const sanitizedFilename = `${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
   const filePath = `${userId}/${sanitizedFilename}`;
 
   try {
-    const command = new PutObjectCommand({
+    await r2Client.send(new PutObjectCommand({
       Bucket: env.R2_BUCKET_NAME,
-      Key: filePath, // Stores as "userId/filename" in the root of the bucket
+      Key: filePath,
       Body: file.buffer,
       ContentType: file.mimetype
-    });
+    }));
 
-    await r2Client.send(command);
-
-    // Construct Public URL
-    // NOTE: This assumes R2 bucket has public access enabled or is behind a Custom Domain
-    // If not, you might need pre-signed URLs similar to Supabase private buckets
-    // For now, we'll try to construct a public URL assuming a custom domain or public R2 dev URL
-    // Since we don't have a custom domain var, we will use the S3 endpoint pattern or a placeholder
-    // Ideally user provides R2_PUBLIC_DOMAIN in .env
-
-    // Fallback: If no custom domain, this might not be publicly accessible directly without auth
-    // But for the sake of the task, we will return the path key and a constructed URL
-
-    // Strategy: Return a URL that the frontend can use. 
-    // If authenticated, maybe we should use signed URLs for R2 too?
-    // Use the controller's logic to sign URLs if needed later. 
-    // For now, assume public access or signed URL generation on fetch.
-
-    // We will store the full S3 endpoint URL as a fallback
+    // Public URL — assumes the bucket has public access or is behind a custom domain.
+    // For private buckets the signed-URL flow in viewUploadByUrl handles serving.
     const publicUrl = `${env.R2_ENDPOINT}/${env.R2_BUCKET_NAME}/${filePath}`;
 
     return {
       url: publicUrl,
       path: filePath,
       sanitizedFilename,
-      width: null,
-      height: null
+      width: null as number | null,
+      height: null as number | null
     };
-
   } catch (error: any) {
     logger.error('Cloudflare R2 upload failed', { error: error.message });
-    throw new ApiError(500, 'Failed to upload to Cloudflare R2');
+    throw new ApiError(500, 'Failed to upload file');
   }
 }
 
-/**
- * Delete file from Supabase
- */
-async function deleteFromSupabase(filePath: string) {
-  const { error } = await supabaseAdmin.storage
-    .from(env.SUPABASE_BUCKET)
-    .remove([filePath]);
-
-  if (error) {
-    logger.error('Failed to delete from Supabase', { error: error.message });
-  }
-}
-
-/**
- * Delete file from Cloudflare R2
- */
 async function deleteFromCloudflareR2(filePath: string) {
   try {
-    const command = new DeleteObjectCommand({
+    await r2Client.send(new DeleteObjectCommand({
       Bucket: env.R2_BUCKET_NAME,
       Key: filePath
-    });
-
-    await r2Client.send(command);
+    }));
     logger.info('Deleted file from R2', { filePath });
-
   } catch (error: any) {
-    logger.error('Failed to delete from Cloudflare R2', { error: error.message, filePath });
-    // Don't throw logic error here to allow DB cleanup to proceed potentially?
-    // Or throw to consistency? Let's catch and log to allow soft-fail.
+    // Log but don't rethrow — the DB row is already being removed and
+    // orphaned R2 objects can be cleaned up by a lifecycle rule.
+    logger.error('Failed to delete from R2', { error: error.message, filePath });
   }
 }

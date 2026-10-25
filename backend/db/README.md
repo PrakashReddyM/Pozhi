@@ -43,7 +43,7 @@ docker compose exec postgres psql -U pozhi -d pozhi
 ## Connection string
 
 ```
-DATABASE_URL=postgresql://pozhi:pozhi_local_dev@localhost:5432/pozhi
+DATABASE_URL=postgresql://pozhi:pozhi_local_dev@localhost:5433/pozhi
 REDIS_URL=redis://localhost:6379
 ```
 
