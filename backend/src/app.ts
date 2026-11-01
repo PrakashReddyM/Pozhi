@@ -98,6 +98,11 @@ app.use(cors({
       return callback(null, true);
     }
 
+    // Allow VS Code / Microsoft dev tunnels (devtunnels.ms) for local development
+    if (env.NODE_ENV !== 'production' && origin.endsWith('.devtunnels.ms')) {
+      return callback(null, true);
+    }
+
     // Check if origin is in allowed list
     if (allowedOrigins.includes(origin)) {
       callback(null, true);

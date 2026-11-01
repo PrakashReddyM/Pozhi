@@ -38,6 +38,11 @@ backend/logs/
 **/.wwebjs_auth/
 .supabase/
 
+# Production deployment — secrets and SSL certs
+.env
+nginx/certbot/conf/
+nginx/certbot/www/
+
 # IDEs
 .vscode/
 .idea/

@@ -584,8 +584,10 @@ const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
  * The redirect URI must be byte-identical in the authorize request and the
  * token exchange, and must be registered in the Google Cloud console.
  */
-const googleRedirectUri = (): string =>
-  env.GOOGLE_AUTH_REDIRECT_URL || `${env.FRONTEND_URL}/login`;
+const googleRedirectUri = (override?: string): string => {
+  if (override) return override;
+  return env.GOOGLE_AUTH_REDIRECT_URL || `${env.FRONTEND_URL}/login`;
+};
 
 export const loginWithGoogle = async (
   req: Request,
@@ -604,17 +606,19 @@ export const loginWithGoogle = async (
       );
     }
 
+    const callerRedirectUri = (req.query.redirectTo as string) || null;
+
     // Signed, short-lived state. This is the CSRF defence for the callback:
     // a code delivered with state we did not sign is not ours.
     const state = jwt.sign(
-      { purpose: 'google_oauth', redirectTo: (req.query.redirectTo as string) || null },
+      { purpose: 'google_oauth', redirectTo: callerRedirectUri, redirectUri: callerRedirectUri },
       env.JWT_SECRET,
       { expiresIn: '10m' }
     );
 
     const url = `${GOOGLE_AUTH_ENDPOINT}?${new URLSearchParams({
       client_id: env.GOOGLE_CLIENT_ID!,
-      redirect_uri: googleRedirectUri(),
+      redirect_uri: googleRedirectUri(callerRedirectUri || undefined),
       response_type: 'code',
       scope: 'openid email profile',
       access_type: 'offline',
@@ -642,7 +646,7 @@ export const exchangeCodeForSession = async (
   next: NextFunction
 ) => {
   try {
-    const { code, state } = req.body;
+    const { code, state, redirectUri } = req.body;
 
     if (!code) {
       throw new ApiError(400, 'OAuth code is required');
@@ -668,7 +672,7 @@ export const exchangeCodeForSession = async (
         code,
         client_id: env.GOOGLE_CLIENT_ID!,
         client_secret: env.GOOGLE_CLIENT_SECRET!,
-        redirect_uri: googleRedirectUri(),
+        redirect_uri: googleRedirectUri(redirectUri || undefined),
         grant_type: 'authorization_code'
       }).toString(),
       signal: AbortSignal.timeout(10_000)

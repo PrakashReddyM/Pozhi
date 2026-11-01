@@ -24,7 +24,7 @@ interface AuthContextType {
   isAuthenticated: boolean;
   login: (email: string, password: string) => Promise<void>;
   loginWithGoogle: (redirectTo?: string) => Promise<string>;
-  completeGoogleLogin: (code: string) => Promise<void>;
+  completeGoogleLogin: (code: string, redirectUri?: string) => Promise<void>;
   completeGoogleLoginWithHash: (hash: string) => Promise<void>;
   loginWithPasskey: (email?: string) => Promise<void>;
   signup: (data: { email: string; password: string; full_name: string; phone?: string }) => Promise<void>;
@@ -174,9 +174,9 @@ const loginWithGoogle = useCallback(async (redirectTo?: string) => {
     return url;
   }, []);
 
-  const completeGoogleLogin = useCallback(async (code: string) => {
-    const { user: loggedInUser, session } = await apiExchangeCodeForGoogleSession(code);
-    
+  const completeGoogleLogin = useCallback(async (code: string, redirectUri?: string) => {
+    const { user: loggedInUser, session } = await apiExchangeCodeForGoogleSession(code, redirectUri);
+
     if (loggedInUser.role !== 'admin') {
       throw new Error("Admin access required.");
     }

@@ -44,7 +44,7 @@ const AdminPrices = () => {
           id: "passphoto",
           name: "Passport Photo",
           image: passphotoImg,
-          variants: data.passphoto.flatMap(cat =>
+          variants: data.passphoto.categories.flatMap(cat =>
             cat.packs.map(p => ({
               key: `passphoto_packs|${p.id}`,
               label: `${p.label} (${p.copies} copies) - ${cat.label}`,
@@ -103,7 +103,7 @@ const AdminPrices = () => {
           id: "snapnprint",
           name: "Snap & Print",
           image: snapnprintImg,
-          variants: data.snapnprint.flatMap(cat =>
+          variants: data.snapnprint.categories.flatMap(cat =>
             cat.packages.map(p => ({
               key: `snapnprint_packages|${p.id}`,
               label: `${p.label} - ${cat.label}`,

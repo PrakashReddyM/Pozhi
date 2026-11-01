@@ -193,11 +193,11 @@ export async function fetchSnapnPrintPricing(): Promise<SnapnPrintCategory[]> {
  * Fetch ALL pricing at once (convenience method for caching)
  */
 export async function fetchAllPricing(): Promise<{
-    passphoto: PassPhotoCategory[];
+    passphoto: { categories: PassPhotoCategory[] };
     photocopies: { single: PhotoCopySingle[]; set: PhotoCopySet[] };
     frames: { materials: FrameMaterial[]; sizes: FrameSize[] };
     albums: AlbumCapacity[];
-    snapnprint: SnapnPrintCategory[];
+    snapnprint: { categories: SnapnPrintCategory[] };
 }> {
     return await fetchWithCache<any>('/pricing/all');
 }
@@ -476,11 +476,11 @@ export async function loginWithGoogle(redirectTo?: string): Promise<{ url: strin
     return json.data;
 }
 
-export async function exchangeCodeForGoogleSession(code: string): Promise<LoginResponse> {
+export async function exchangeCodeForGoogleSession(code: string, redirectUri?: string): Promise<LoginResponse> {
     const response = await fetch(`${API_BASE_URL}/auth/google/exchange`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code }),
+        body: JSON.stringify({ code, redirectUri }),
     });
 
     const json = await response.json();
