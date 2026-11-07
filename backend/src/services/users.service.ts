@@ -1,127 +1,217 @@
-import { supabase } from '../config/supabase';
+import { and, desc, eq } from 'drizzle-orm';
+import { db, schema } from '../db';
 import { ApiError } from '../utils/ApiError';
+import { findOrders } from '../api/orders/orders.queries';
+
+// ==========================================
+// USERS SERVICE
+//
+// Profile and address CRUD for the logged-in customer.
+// Migrated from Supabase to Drizzle/PostgreSQL.
+// ==========================================
+
+// Fields the customer is allowed to update on their profile.
+// Internal fields (role, isBanned, passwordHash …) are not exposed here.
+const PROFILE_UPDATABLE_FIELDS: Record<string, keyof typeof schema.profiles.$inferSelect> = {
+  full_name: 'fullName',
+  fullName: 'fullName',
+  phone: 'phone',
+  avatar_url: 'avatarUrl',
+  avatarUrl: 'avatarUrl'
+};
+
+// Fields accepted in an address create/update payload (snake_case → camelCase).
+const ADDRESS_FIELDS: Record<string, keyof typeof schema.addresses.$inferSelect> = {
+  label: 'label',
+  recipient_name: 'recipientName',
+  recipientName: 'recipientName',
+  phone: 'phone',
+  street_line1: 'streetLine1',
+  streetLine1: 'streetLine1',
+  street_line2: 'streetLine2',
+  streetLine2: 'streetLine2',
+  landmark: 'landmark',
+  city: 'city',
+  state: 'state',
+  zip_code: 'zipCode',
+  zipCode: 'zipCode',
+  country: 'country',
+  is_default: 'isDefault',
+  isDefault: 'isDefault'
+};
+
+function pickAddressFields(raw: Record<string, unknown>) {
+  const out: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(raw)) {
+    const col = ADDRESS_FIELDS[key];
+    if (col) out[col] = val;
+  }
+  return out;
+}
+
+function pickProfileFields(raw: Record<string, unknown>) {
+  const out: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(raw)) {
+    const col = PROFILE_UPDATABLE_FIELDS[key];
+    if (col) out[col] = val;
+  }
+  return out;
+}
 
 export const userService = {
   /**
-   * Get User Profile & Addresses
+   * Get the user's profile row plus their active addresses.
    */
   async getProfile(userId: string) {
-    const { data: profile, error: profileError } = await supabase
-      .from('profiles')
-      .select('*')
-      .eq('id', userId)
-      .single();
+    const [profile] = await db
+      .select()
+      .from(schema.profiles)
+      .where(eq(schema.profiles.id, userId))
+      .limit(1);
 
-    if (profileError) throw new ApiError(500, 'Failed to fetch profile');
+    if (!profile) throw new ApiError(404, 'Profile not found');
 
-    // Reuse getAddresses logic
     const addresses = await this.getAddresses(userId);
 
-    return { ...profile, addresses };
+    // Omit internal-only fields before returning to the API layer.
+    const { passwordHash, googleSub, failedLoginAttempts, lastFailedLogin,
+            accountLockedUntil, ...safeProfile } = profile;
+
+    return { ...safeProfile, addresses };
   },
 
   /**
-   * Update Profile Details
+   * Update allowed profile fields (full_name, phone, avatar_url).
    */
-  async updateProfile(userId: string, updates: any) {
-    const { data, error } = await supabase
-      .from('profiles')
-      .update(updates)
-      .eq('id', userId)
-      .select()
-      .single();
+  async updateProfile(userId: string, updates: Record<string, unknown>) {
+    const changes = pickProfileFields(updates);
 
-    if (error) throw new ApiError(500, 'Failed to update profile');
-    return data;
+    if (Object.keys(changes).length === 0) {
+      throw new ApiError(400, 'No updatable fields provided');
+    }
+
+    changes.updatedAt = new Date().toISOString();
+
+    const [updated] = await db
+      .update(schema.profiles)
+      .set(changes)
+      .where(eq(schema.profiles.id, userId))
+      .returning();
+
+    if (!updated) throw new ApiError(404, 'Profile not found');
+
+    const { passwordHash, googleSub, failedLoginAttempts, lastFailedLogin,
+            accountLockedUntil, ...safeProfile } = updated;
+
+    return safeProfile;
   },
 
   /**
-   * Get All Addresses for User
+   * Return active addresses for the user, default first.
    */
   async getAddresses(userId: string) {
-    const { data, error } = await supabase
-      .from('addresses')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('is_active', true)
-      .order('is_default', { ascending: false });
-
-    if (error) throw new ApiError(500, 'Failed to fetch addresses');
-    return data || [];
+    return db
+      .select()
+      .from(schema.addresses)
+      .where(and(
+        eq(schema.addresses.userId, userId),
+        eq(schema.addresses.isActive, true)
+      ))
+      .orderBy(desc(schema.addresses.isDefault));
   },
 
   /**
-   * Add New Address
+   * Create a new address.
+   * If is_default is true, clears all other defaults for the user first
+   * (can't use a partial unique index for automatic enforcement here because
+   * we allow temporarily having zero defaults during the transition).
    */
-  async addAddress(userId: string, addressData: any) {
-    // If setting as default, unset other defaults first
-    if (addressData.is_default) {
-      await supabase
-        .from('addresses')
-        .update({ is_default: false })
-        .eq('user_id', userId);
+  async addAddress(userId: string, addressData: Record<string, unknown>) {
+    const fields = pickAddressFields(addressData);
+
+    if (fields.isDefault) {
+      await db
+        .update(schema.addresses)
+        .set({ isDefault: false })
+        .where(and(
+          eq(schema.addresses.userId, userId),
+          eq(schema.addresses.isActive, true)
+        ));
     }
 
-    const { data, error } = await supabase
-      .from('addresses')
-      .insert({ ...addressData, user_id: userId })
-      .select()
-      .single();
+    const [created] = await db
+      .insert(schema.addresses)
+      .values({ ...fields, userId } as any)
+      .returning();
 
-    if (error) throw new ApiError(500, error.message);
-    return data;
+    return created;
   },
 
   /**
-   * Update Existing Address
+   * Update an existing address. Ownership is enforced by requiring user_id
+   * in the WHERE clause rather than a separate look-up.
    */
-  async updateAddress(userId: string, addressId: string, updates: any) {
-    // If setting as default, unset other defaults first
-    if (updates.is_default) {
-      await supabase
-        .from('addresses')
-        .update({ is_default: false })
-        .eq('user_id', userId);
+  async updateAddress(
+    userId: string,
+    addressId: string,
+    updates: Record<string, unknown>
+  ) {
+    const fields = pickAddressFields(updates);
+
+    if (Object.keys(fields).length === 0) {
+      throw new ApiError(400, 'No updatable fields provided');
     }
 
-    const { data, error } = await supabase
-      .from('addresses')
-      .update(updates)
-      .eq('id', addressId)
-      .eq('user_id', userId) // Security: Ensure ownership
-      .select()
-      .single();
+    if (fields.isDefault) {
+      await db
+        .update(schema.addresses)
+        .set({ isDefault: false })
+        .where(and(
+          eq(schema.addresses.userId, userId),
+          eq(schema.addresses.isActive, true)
+        ));
+    }
 
-    if (error) throw new ApiError(500, 'Failed to update address');
-    if (!data) throw new ApiError(404, 'Address not found');
-    
-    return data;
+    fields.updatedAt = new Date().toISOString();
+
+    const [updated] = await db
+      .update(schema.addresses)
+      .set(fields as any)
+      .where(and(
+        eq(schema.addresses.id, addressId),
+        eq(schema.addresses.userId, userId)
+      ))
+      .returning();
+
+    if (!updated) throw new ApiError(404, 'Address not found');
+
+    return updated;
   },
 
   /**
-   * Delete Address (Soft Delete)
+   * Soft-delete an address (is_active = false).
+   * Hard deletes are not done because address data may be referenced by past orders.
    */
   async deleteAddress(userId: string, addressId: string) {
-    const { error } = await supabase
-      .from('addresses')
-      .update({ is_active: false }) // Don't actually delete, just hide
-      .eq('id', addressId)
-      .eq('user_id', userId);
+    const [deleted] = await db
+      .update(schema.addresses)
+      .set({ isActive: false, updatedAt: new Date().toISOString() })
+      .where(and(
+        eq(schema.addresses.id, addressId),
+        eq(schema.addresses.userId, userId)
+      ))
+      .returning({ id: schema.addresses.id });
 
-    if (error) throw new ApiError(500, 'Failed to delete address');
+    if (!deleted) throw new ApiError(404, 'Address not found');
   },
 
   /**
-   * Get User Orders (Shortcut)
+   * Return the user's orders with nested items (same shape as the PostgREST
+   * response the frontend was already consuming).
    */
   async getOrders(userId: string) {
-    const { data, error } = await supabase
-      .from('orders')
-      .select('*, items:order_items(*)')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false });
-
-    if (error) throw new ApiError(500, 'Failed to fetch orders');
-    return data;
+    return findOrders({
+      where: eq(schema.orders.userId, userId)
+    });
   }
 };

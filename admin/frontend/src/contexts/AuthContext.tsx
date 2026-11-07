@@ -1,6 +1,5 @@
 import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
 import { startAuthentication } from '@simplewebauthn/browser';
-import { supabase } from '@/config/supabase';
 import {
   login as apiLogin,
   signup as apiSignup,
@@ -25,7 +24,7 @@ interface AuthContextType {
   isAuthenticated: boolean;
   login: (email: string, password: string) => Promise<void>;
   loginWithGoogle: (redirectTo?: string) => Promise<string>;
-  completeGoogleLogin: (code: string) => Promise<void>;
+  completeGoogleLogin: (code: string, redirectUri?: string) => Promise<void>;
   completeGoogleLoginWithHash: (hash: string) => Promise<void>;
   loginWithPasskey: (email?: string) => Promise<void>;
   signup: (data: { email: string; password: string; full_name: string; phone?: string }) => Promise<void>;
@@ -170,27 +169,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(loggedInUser);
   }, []);
 const loginWithGoogle = useCallback(async (redirectTo?: string) => {
-  // We initiate the OAuth flow from the frontend so that Supabase can set the
-  // required state/PKCE cookies in the browser. This fixes "bad_oauth_state"
-  // and avoids the backend's hardcoded localhost:3000 redirect defaults.
-  const { data, error } = await supabase.auth.signInWithOAuth({
-    provider: 'google',
-    options: {
-      redirectTo: redirectTo || `${window.location.origin}/login`,
-      queryParams: {
-        access_type: 'offline',
-        prompt: 'consent',
-      },
-    },
-  });
+    // The backend builds the Google OAuth URL with a signed CSRF state parameter.
+    const { url } = await apiLoginWithGoogle(redirectTo);
+    return url;
+  }, []);
 
-  if (error) throw error;
-  return data.url || '';
-}, []);
+  const completeGoogleLogin = useCallback(async (code: string, redirectUri?: string) => {
+    const { user: loggedInUser, session } = await apiExchangeCodeForGoogleSession(code, redirectUri);
 
-  const completeGoogleLogin = useCallback(async (code: string) => {
-    const { user: loggedInUser, session } = await apiExchangeCodeForGoogleSession(code);
-    
     if (loggedInUser.role !== 'admin') {
       throw new Error("Admin access required.");
     }

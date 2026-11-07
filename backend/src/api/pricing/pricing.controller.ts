@@ -1,532 +1,342 @@
 // ==========================================
 // PRICING CONTROLLER - Serve all pricing data
+//
+// Migrated from Supabase/PostgREST to Drizzle. Two things changed in the shape
+// of the code, not in the shape of the responses:
+//
+//   * Rows now come back with camelCase keys, because that is how the
+//     introspected schema names the columns. The JSON sent to the frontend is
+//     unchanged - the mapping functions below absorb the difference.
+//   * Failed queries throw instead of returning an error object, so the
+//     per-query `if (error)` blocks are gone; the try/catch handles it.
 // ==========================================
 
 import { Request, Response, NextFunction } from 'express';
-import { supabaseAdmin as supabase } from '../../config/supabase';
+import { asc, eq } from 'drizzle-orm';
+import { db, schema } from '../../db';
 import { ApiError } from '../../utils/ApiError';
 import { logger } from '../../utils/logger';
 
 // ==========================================
-// GET PASSPHOTO PRICING
+// HELPERS
 // ==========================================
 
-export const getPassPhotoPricing = async (
-    req: Request,
-    res: Response,
-    next: NextFunction
-) => {
-    try {
-        // Fetch all categories with their packs
-        const { data: categories, error: catError } = await supabase
-            .from('passphoto_categories')
-            .select('*')
-            .eq('is_active', true)
-            .order('display_order');
+/**
+ * Every catalogue table shares the same read: active rows, in display order.
+ */
+type CatalogueTable =
+  | typeof schema.passphotoCategories
+  | typeof schema.passphotoPacks
+  | typeof schema.photocopiesSingle
+  | typeof schema.photocopiesSet
+  | typeof schema.frameMaterials
+  | typeof schema.frameSizes
+  | typeof schema.albumCapacities
+  | typeof schema.snapnprintCategories
+  | typeof schema.snapnprintPackages;
 
-        if (catError) {
-            console.error('SUPABASE ERROR (PassPhoto Categories):', catError);
-            throw new ApiError(500, 'Failed to fetch pricing data');
-        }
+async function activeRows<T extends CatalogueTable>(table: T) {
+  return db
+    .select()
+    .from(table as any)
+    .where(eq((table as any).isActive, true))
+    .orderBy(asc((table as any).displayOrder)) as Promise<any[]>;
+}
 
-        // Fetch all packs and group by category
-        const { data: packs, error: packsError } = await supabase
-            .from('passphoto_packs')
-            .select('*')
-            .eq('is_active', true)
-            .order('display_order');
-
-        if (packsError) {
-            console.error('SUPABASE ERROR (PassPhoto Packs):', packsError);
-            throw new ApiError(500, 'Failed to fetch pricing data');
-        }
-
-        // Group packs by category
-        const categoriesWithPacks = categories?.map(category => ({
-            id: category.category_id,
-            label: category.label,
-            columns: category.columns,
-            rows: category.rows,
-            aspectLabel: category.aspect_label,
-            packs: packs
-                ?.filter(pack => pack.category_id === category.id)
-                .map(pack => ({
-                    id: pack.id, // Use UUID
-                    packId: pack.pack_id, // Keep text ID just in case
-                    label: pack.label,
-                    copies: pack.copies,
-                    price: parseFloat(pack.price),
-                    description: pack.description
-                })) || []
-        })) || [];
-
-        res.status(200).json({
-            status: 'success',
-            data: {
-                categories: categoriesWithPacks
-            }
-        });
-
-    } catch (error) {
-        next(error);
-    }
-};
+/** Numeric columns arrive from pg as strings to protect decimal precision. */
+const money = (value: string | null) => parseFloat(value ?? '0');
 
 // ==========================================
-// GET PHOTOCOPIES PRICING
+// SHAPE MAPPERS (the response contract the frontends rely on)
 // ==========================================
 
-export const getPhotoCopiesPricing = async (
-    req: Request,
-    res: Response,
-    next: NextFunction
-) => {
-    try {
-        // Fetch single options
-        const { data: singleOptions, error: singleError } = await supabase
-            .from('photocopies_single')
-            .select('*')
-            .eq('is_active', true)
-            .order('display_order');
+const mapPassPhotoCategories = (categories: any[], packs: any[]) =>
+  categories.map((category) => ({
+    id: category.categoryId,
+    label: category.label,
+    columns: category.columns,
+    rows: category.rows,
+    aspectLabel: category.aspectLabel,
+    packs: packs
+      .filter((pack) => pack.categoryId === category.id)
+      .map((pack) => ({
+        id: pack.id,
+        packId: pack.packId,
+        label: pack.label,
+        copies: pack.copies,
+        price: money(pack.price),
+        description: pack.description
+      }))
+  }));
 
-        if (singleError) {
-            console.error('SUPABASE ERROR (Single Options):', singleError);
-            throw new ApiError(500, 'Failed to fetch pricing data');
-        }
+const mapPhotoCopies = (singleOptions: any[], setOptions: any[]) => ({
+  single: singleOptions.map((opt) => ({
+    id: opt.id,
+    optionId: opt.optionId,
+    sizeLabel: opt.sizeLabel,
+    sizeKey: opt.sizeKey,
+    copies: opt.copiesText,
+    price: money(opt.price),
+    aspectRatio: opt.aspectRatio
+  })),
+  set: setOptions.map((opt) => ({
+    id: opt.id,
+    setId: opt.setId,
+    sizeLabel: opt.sizeLabel,
+    sizeKey: opt.sizeKey,
+    pricePerPiece: money(opt.pricePerPiece),
+    aspectRatio: opt.aspectRatio,
+    copiesPerUnit: opt.copiesPerUnit
+  }))
+});
 
-        // Fetch set options
-        const { data: setOptions, error: setError } = await supabase
-            .from('photocopies_set')
-            .select('*')
-            .eq('is_active', true)
-            .order('display_order');
+const mapFrames = (materials: any[], sizes: any[]) => ({
+  materials: materials.map((mat) => ({
+    id: mat.id,
+    materialId: mat.materialId,
+    label: mat.label,
+    description: mat.description
+  })),
+  sizes: sizes.map((size) => ({
+    id: size.id,
+    sizeId: size.sizeId,
+    sizeLabel: size.sizeLabel,
+    dimensions: size.dimensions,
+    price: money(size.price),
+    aspectRatio: size.aspectRatio,
+    orientation: size.orientation
+  }))
+});
 
-        if (setError) {
-            console.error('SUPABASE ERROR (Set Options):', setError);
-            throw new ApiError(500, 'Failed to fetch pricing data');
-        }
+const mapAlbumCapacities = (capacities: any[]) =>
+  capacities.map((cap) => ({
+    id: cap.id,
+    capacityId: cap.capacityId,
+    label: cap.label,
+    images: cap.images,
+    price: money(cap.price)
+  }));
 
-        res.status(200).json({
-            status: 'success',
-            data: {
-                single: singleOptions?.map(opt => ({
-                    id: opt.id, // Use UUID
-                    optionId: opt.option_id,
-                    sizeLabel: opt.size_label,
-                    sizeKey: opt.size_key,
-                    copies: opt.copies_text,
-                    price: parseFloat(opt.price),
-                    aspectRatio: opt.aspect_ratio
-                })) || [],
-                set: setOptions?.map(opt => ({
-                    id: opt.id, // Use UUID
-                    setId: opt.set_id,
-                    sizeLabel: opt.size_label,
-                    sizeKey: opt.size_key,
-                    pricePerPiece: parseFloat(opt.price_per_piece),
-                    aspectRatio: opt.aspect_ratio,
-                    copiesPerUnit: opt.copies_per_unit
-                })) || []
-            }
-        });
-
-    } catch (error) {
-        next(error);
-    }
-};
-
-// ==========================================
-// GET FRAMES PRICING
-// ==========================================
-
-export const getFramesPricing = async (
-    req: Request,
-    res: Response,
-    next: NextFunction
-) => {
-    try {
-        // Fetch materials
-        const { data: materials, error: materialsError } = await supabase
-            .from('frame_materials')
-            .select('*')
-            .eq('is_active', true)
-            .order('display_order');
-
-        if (materialsError) {
-            console.error('SUPABASE ERROR (Frame Materials):', materialsError);
-            throw new ApiError(500, 'Failed to fetch pricing data');
-        }
-
-        // Fetch sizes
-        const { data: sizes, error: sizesError } = await supabase
-            .from('frame_sizes')
-            .select('*')
-            .eq('is_active', true)
-            .order('display_order');
-
-        if (sizesError) {
-            console.error('SUPABASE ERROR (Frame Sizes):', sizesError);
-            throw new ApiError(500, 'Failed to fetch pricing data');
-        }
-
-        res.status(200).json({
-            status: 'success',
-            data: {
-                materials: materials?.map(mat => ({
-                    id: mat.id, // Use UUID
-                    materialId: mat.material_id,
-                    label: mat.label,
-                    description: mat.description
-                })) || [],
-                sizes: sizes?.map(size => ({
-                    id: size.id, // Use UUID
-                    sizeId: size.size_id,
-                    sizeLabel: size.size_label,
-                    dimensions: size.dimensions,
-                    price: parseFloat(size.price),
-                    aspectRatio: size.aspect_ratio,
-                    orientation: size.orientation
-                })) || []
-            }
-        });
-
-    } catch (error) {
-        next(error);
-    }
-};
+const mapSnapnPrintCategories = (categories: any[], packages: any[]) =>
+  categories.map((category) => ({
+    id: category.categoryId,
+    label: category.label,
+    description: category.description,
+    packages: packages
+      .filter((pkg) => pkg.categoryId === category.id)
+      .map((pkg) => ({
+        id: pkg.id,
+        packageId: pkg.packageId,
+        label: pkg.label,
+        price: money(pkg.price)
+      }))
+  }));
 
 // ==========================================
-// GET ALBUM PRICING
+// DATA LOADERS (shared by the single and combined endpoints)
 // ==========================================
 
-export const getAlbumPricing = async (
-    req: Request,
-    res: Response,
-    next: NextFunction
-) => {
-    try {
-        const { data: capacities, error } = await supabase
-            .from('album_capacities')
-            .select('*')
-            .eq('is_active', true)
-            .order('display_order');
-
-        if (error) {
-            console.error('SUPABASE ERROR (Album Capacities):', error);
-            throw new ApiError(500, 'Failed to fetch pricing data');
-        }
-
-        res.status(200).json({
-            status: 'success',
-            data: {
-                capacities: capacities?.map(cap => ({
-                    id: cap.id, // Use UUID
-                    capacityId: cap.capacity_id,
-                    label: cap.label,
-                    images: cap.images,
-                    price: parseFloat(cap.price)
-                })) || []
-            }
-        });
-
-    } catch (error) {
-        next(error);
-    }
-};
-
-// ==========================================
-// GET SNAP'N'PRINT PRICING
-// ==========================================
-
-export const getSnapnPrintPricing = async (
-    req: Request,
-    res: Response,
-    next: NextFunction
-) => {
-    try {
-        // Fetch categories
-        const { data: categories, error: catError } = await supabase
-            .from('snapnprint_categories')
-            .select('*')
-            .eq('is_active', true)
-            .order('display_order');
-
-        if (catError) {
-            console.error('SUPABASE ERROR (SnapnPrint Categories):', catError);
-            throw new ApiError(500, 'Failed to fetch pricing data');
-        }
-
-        // Fetch packages
-        const { data: packages, error: packError } = await supabase
-            .from('snapnprint_packages')
-            .select('*')
-            .eq('is_active', true)
-            .order('display_order');
-
-        if (packError) {
-            console.error('SUPABASE ERROR (SnapnPrint Packages):', packError);
-            throw new ApiError(500, 'Failed to fetch pricing data');
-        }
-
-        // Group packages by category
-        const categoriesWithPackages = categories?.map(category => ({
-            id: category.category_id,
-            label: category.label,
-            description: category.description,
-            packages: packages
-                ?.filter(pkg => pkg.category_id === category.id)
-                .map(pkg => ({
-                    id: pkg.id, // Use UUID
-                    packageId: pkg.package_id,
-                    label: pkg.label,
-                    price: parseFloat(pkg.price)
-                })) || []
-        })) || [];
-
-        res.status(200).json({
-            status: 'success',
-            data: {
-                categories: categoriesWithPackages
-            }
-        });
-
-    } catch (error) {
-        next(error);
-    }
-};
-
-// ==========================================
-// GET ALL PRICING (Convenience endpoint)
-// ==========================================
-
-export const getAllPricing = async (
-    req: Request,
-    res: Response,
-    next: NextFunction
-) => {
-    try {
-        logger.info('Fetching all pricing data');
-
-        // This is a convenience endpoint that fetches all pricing at once
-        // Useful for initial app load or caching
-        const passphoto = await getPassPhotoPricingData();
-        const photocopies = await getPhotoCopiesPricingData();
-        const frames = await getFramesPricingData();
-        const albums = await getAlbumPricingData();
-        const snapnprint = await getSnapnPrintPricingData();
-
-        res.status(200).json({
-            status: 'success',
-            data: {
-                passphoto,
-                photocopies,
-                frames,
-                albums,
-                snapnprint
-            }
-        });
-
-    } catch (error) {
-        next(error);
-    }
-};
-
-// Helper functions for getAllPricing
 async function getPassPhotoPricingData() {
-    const { data: categories } = await supabase
-        .from('passphoto_categories')
-        .select('*')
-        .eq('is_active', true)
-        .order('display_order');
-
-    const { data: packs } = await supabase
-        .from('passphoto_packs')
-        .select('*')
-        .eq('is_active', true)
-        .order('display_order');
-
-    return categories?.map(category => ({
-        id: category.category_id,
-        label: category.label,
-        columns: category.columns,
-        rows: category.rows,
-        aspectLabel: category.aspect_label,
-        packs: packs
-            ?.filter(pack => pack.category_id === category.id)
-            .map(pack => ({
-                id: pack.id, // Use UUID
-                packId: pack.pack_id,
-                label: pack.label,
-                copies: pack.copies,
-                price: parseFloat(pack.price),
-                description: pack.description
-            })) || []
-    })) || [];
+  const [categories, packs] = await Promise.all([
+    activeRows(schema.passphotoCategories),
+    activeRows(schema.passphotoPacks)
+  ]);
+  return { categories: mapPassPhotoCategories(categories, packs) };
 }
 
 async function getPhotoCopiesPricingData() {
-    const { data: singleOptions } = await supabase
-        .from('photocopies_single')
-        .select('*')
-        .eq('is_active', true)
-        .order('display_order');
-
-    const { data: setOptions } = await supabase
-        .from('photocopies_set')
-        .select('*')
-        .eq('is_active', true)
-        .order('display_order');
-
-    return {
-        single: singleOptions?.map(opt => ({
-            id: opt.id, // Use UUID
-            optionId: opt.option_id,
-            sizeLabel: opt.size_label,
-            sizeKey: opt.size_key,
-            copies: opt.copies_text,
-            price: parseFloat(opt.price),
-            aspectRatio: opt.aspect_ratio
-        })) || [],
-        set: setOptions?.map(opt => ({
-            id: opt.id, // Use UUID
-            setId: opt.set_id,
-            sizeLabel: opt.size_label,
-            sizeKey: opt.size_key,
-            pricePerPiece: parseFloat(opt.price_per_piece),
-            aspectRatio: opt.aspect_ratio,
-            copiesPerUnit: opt.copies_per_unit
-        })) || []
-    };
+  const [singleOptions, setOptions] = await Promise.all([
+    activeRows(schema.photocopiesSingle),
+    activeRows(schema.photocopiesSet)
+  ]);
+  return mapPhotoCopies(singleOptions, setOptions);
 }
 
 async function getFramesPricingData() {
-    const { data: materials } = await supabase
-        .from('frame_materials')
-        .select('*')
-        .eq('is_active', true)
-        .order('display_order');
-
-    const { data: sizes } = await supabase
-        .from('frame_sizes')
-        .select('*')
-        .eq('is_active', true)
-        .order('display_order');
-
-    return {
-        materials: materials?.map(mat => ({
-            id: mat.id, // Use UUID
-            materialId: mat.material_id,
-            label: mat.label,
-            description: mat.description
-        })) || [],
-        sizes: sizes?.map(size => ({
-            id: size.id, // Use UUID
-            sizeId: size.size_id,
-            sizeLabel: size.size_label,
-            dimensions: size.dimensions,
-            price: parseFloat(size.price),
-            aspectRatio: size.aspect_ratio,
-            orientation: size.orientation
-        })) || []
-    };
+  const [materials, sizes] = await Promise.all([
+    activeRows(schema.frameMaterials),
+    activeRows(schema.frameSizes)
+  ]);
+  return mapFrames(materials, sizes);
 }
 
 async function getAlbumPricingData() {
-    const { data: capacities } = await supabase
-        .from('album_capacities')
-        .select('*')
-        .eq('is_active', true)
-        .order('display_order');
-
-    return capacities?.map(cap => ({
-        id: cap.id, // Use UUID
-        capacityId: cap.capacity_id,
-        label: cap.label,
-        images: cap.images,
-        price: parseFloat(cap.price)
-    })) || [];
+  return mapAlbumCapacities(await activeRows(schema.albumCapacities));
 }
 
 async function getSnapnPrintPricingData() {
-    const { data: categories } = await supabase
-        .from('snapnprint_categories')
-        .select('*')
-        .eq('is_active', true)
-        .order('display_order');
-
-    const { data: packages } = await supabase
-        .from('snapnprint_packages')
-        .select('*')
-        .eq('is_active', true)
-        .order('display_order');
-
-    return categories?.map(category => ({
-        id: category.category_id,
-        label: category.label,
-        description: category.description,
-        packages: packages
-            ?.filter(pkg => pkg.category_id === category.id)
-            .map(pkg => ({
-                id: pkg.id, // Use UUID
-                packageId: pkg.package_id,
-                label: pkg.label,
-                price: parseFloat(pkg.price)
-            })) || []
-    })) || [];
+  const [categories, packages] = await Promise.all([
+    activeRows(schema.snapnprintCategories),
+    activeRows(schema.snapnprintPackages)
+  ]);
+  return { categories: mapSnapnPrintCategories(categories, packages) };
 }
+
+// ==========================================
+// ENDPOINTS
+// ==========================================
+
+export const getPassPhotoPricing = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    res.status(200).json({ status: 'success', data: await getPassPhotoPricingData() });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getPhotoCopiesPricing = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    res.status(200).json({ status: 'success', data: await getPhotoCopiesPricingData() });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getFramesPricing = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    res.status(200).json({ status: 'success', data: await getFramesPricingData() });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getAlbumPricing = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    res.status(200).json({
+      status: 'success',
+      data: { capacities: await getAlbumPricingData() }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getSnapnPrintPricing = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    res.status(200).json({ status: 'success', data: await getSnapnPrintPricingData() });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Everything at once, for the initial app load.
+ * @route GET /api/v1/pricing
+ */
+export const getAllPricing = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    logger.info('Fetching all pricing data');
+
+    // Independent reads; no reason to serialise them as the old code did.
+    const [passphoto, photocopies, frames, albums, snapnprint] = await Promise.all([
+      getPassPhotoPricingData(),
+      getPhotoCopiesPricingData(),
+      getFramesPricingData(),
+      getAlbumPricingData(),
+      getSnapnPrintPricingData()
+    ]);
+
+    res.status(200).json({
+      status: 'success',
+      data: { passphoto, photocopies, frames, albums, snapnprint }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
 
 // ==========================================
 // UPDATE PRICING (Admin Only)
 // ==========================================
 
+/**
+ * The client names a product type; this maps it to a table and to that table's
+ * price column. Two reasons it is a map rather than a dynamic table name:
+ * the table can never be attacker-controlled, and `photocopies_set` prices its
+ * rows in `price_per_piece` rather than `price` - which the previous dynamic
+ * `.from(type).update({ price })` would have failed on.
+ */
+const PRICE_TARGETS = {
+  // hasUpdatedAt: only passphoto_packs actually carries an updated_at column.
+  // Setting it unconditionally would throw "column does not exist" on the
+  // other five tables.
+  passphoto_packs: { table: schema.passphotoPacks, column: 'price', hasUpdatedAt: true },
+  photocopies_single: { table: schema.photocopiesSingle, column: 'price', hasUpdatedAt: false },
+  photocopies_set: { table: schema.photocopiesSet, column: 'pricePerPiece', hasUpdatedAt: false },
+  frame_sizes: { table: schema.frameSizes, column: 'price', hasUpdatedAt: false },
+  album_capacities: { table: schema.albumCapacities, column: 'price', hasUpdatedAt: false },
+  snapnprint_packages: { table: schema.snapnprintPackages, column: 'price', hasUpdatedAt: false }
+} as const;
+
 export const updatePrice = async (
-    req: Request,
-    res: Response,
-    next: NextFunction
+  req: Request,
+  res: Response,
+  next: NextFunction
 ) => {
-    try {
-        // Check admin role
-        if (req.user?.role !== 'admin') {
-            throw new ApiError(403, 'Admin access required');
-        }
-
-        const { type, id, price } = req.body;
-
-        // Allowlist of tables is handled by Zod validation, but double check here for safety
-        const validTables = [
-            'passphoto_packs',
-            'photocopies_single',
-            'photocopies_set',
-            'frame_sizes',
-            'album_capacities',
-            'snapnprint_packages'
-        ];
-
-        if (!validTables.includes(type)) {
-            throw new ApiError(400, 'Invalid product type');
-        }
-
-        const { data, error } = await supabase
-            .from(type)
-            .update({ price: price, updated_at: new Date().toISOString() })
-            .eq('id', id)
-            .select()
-            .single();
-
-        if (error) {
-            logger.error('Failed to update price', { error: error.message, type, id });
-            throw new ApiError(500, 'Failed to update price');
-        }
-
-        logger.info('Price updated successfully', { type, id, price });
-
-        res.status(200).json({
-            status: 'success',
-            message: 'Price updated successfully',
-            data
-        });
-
-    } catch (error) {
-        next(error);
+  try {
+    if (req.user?.role !== 'admin') {
+      throw new ApiError(403, 'Admin access required');
     }
+
+    const { type, id, price } = req.body;
+
+    const target = PRICE_TARGETS[type as keyof typeof PRICE_TARGETS];
+    if (!target) {
+      throw new ApiError(400, 'Invalid product type');
+    }
+
+    const numericPrice = Number(price);
+    if (!Number.isFinite(numericPrice) || numericPrice < 0) {
+      throw new ApiError(400, 'Price must be a non-negative number');
+    }
+
+    // numeric columns are passed as strings so no float rounding creeps in.
+    const [updated] = await db
+      .update(target.table as any)
+      .set({
+        [target.column]: numericPrice.toFixed(2),
+        // Timestamps are introspected as mode:'string', so pass an ISO string.
+        ...(target.hasUpdatedAt ? { updatedAt: new Date().toISOString() } : {})
+      })
+      .where(eq((target.table as any).id, id))
+      .returning();
+
+    if (!updated) {
+      throw new ApiError(404, 'Product not found');
+    }
+
+    logger.info('Price updated successfully', { type, id, price: numericPrice });
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Price updated successfully',
+      data: updated
+    });
+  } catch (error) {
+    next(error);
+  }
 };

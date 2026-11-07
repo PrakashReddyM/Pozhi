@@ -3,7 +3,9 @@
 // ==========================================
 
 import { Request, Response, NextFunction } from 'express';
-import { supabase, supabaseAdmin } from '../../config/supabase';
+import { and, desc, eq, inArray, isNotNull, ne, sql } from 'drizzle-orm';
+import { db, schema } from '../../db';
+import { findOrder, findOrders } from './orders.queries';
 import { env } from '../../config/env';
 import { ApiError } from '../../utils/ApiError';
 import { logger } from '../../utils/logger';
@@ -39,18 +41,28 @@ const composeDeliveryAddress = (parts: {
     .join(', ');
 };
 
+// Uploads used to be re-sorted in JavaScript after the fetch, because
+// Supabase would not reliably order embedded resources. The replacement
+// queries in orders.queries.ts sort by `position` in SQL, so that helper
+// is gone.
+
 /**
- * Supabase doesn't reliably order embedded resources via the select string,
- * so sort each order_item's linked uploads by position after the fetch.
+ * Catalogue lookup for a single order line: resolve the client's public slug
+ * to the row's UUID and its authoritative price. Returns null when the slug
+ * matches nothing, which the caller turns into a rejected order.
  */
-function sortItemUploads<T>(ordersOrOrder: T): T {
-  const list: any[] = Array.isArray(ordersOrOrder) ? ordersOrOrder : [ordersOrOrder];
-  list.forEach((o: any) => o?.order_items?.forEach((oi: any) => {
-    if (Array.isArray(oi.order_item_uploads)) {
-      oi.order_item_uploads.sort((a: any, b: any) => a.position - b.position);
-    }
-  }));
-  return ordersOrOrder;
+async function priceFromCatalogue<T extends Record<string, any>>(
+  table: any,
+  slugColumn: any,
+  slug: string,
+  columns: T
+): Promise<any | null> {
+  const [row] = await db
+    .select({ id: table.id, ...columns })
+    .from(table)
+    .where(eq(slugColumn, slug))
+    .limit(1);
+  return row ?? null;
 }
 
 /**
@@ -165,11 +177,12 @@ export const createOrder = async (
       switch (itemServiceType) {
         case 'PassPhoto':
           if (item.passphoto_pack_id) {
-            const { data: pack } = await supabaseAdmin
-              .from('passphoto_packs')
-              .select('id, price, label')
-              .eq('pack_id', item.passphoto_pack_id)
-              .single();
+            const pack = await priceFromCatalogue(
+              schema.passphotoPacks,
+              schema.passphotoPacks.packId,
+              item.passphoto_pack_id,
+              { price: schema.passphotoPacks.price, label: schema.passphotoPacks.label }
+            );
             if (pack) {
               unitPrice = parseFloat(pack.price);
               itemDetails.label = pack.label;
@@ -180,26 +193,35 @@ export const createOrder = async (
 
         case 'PhotoCopies':
           if (item.photocopies_single_id) {
-            const { data: single } = await supabaseAdmin
-              .from('photocopies_single')
-              .select('id, price, size_label')
-              .eq('option_id', item.photocopies_single_id)
-              .single();
+            const single = await priceFromCatalogue(
+              schema.photocopiesSingle,
+              schema.photocopiesSingle.optionId,
+              item.photocopies_single_id,
+              {
+                price: schema.photocopiesSingle.price,
+                sizeLabel: schema.photocopiesSingle.sizeLabel
+              }
+            );
             if (single) {
               unitPrice = parseFloat(single.price);
-              itemDetails.size = single.size_label;
+              itemDetails.size = single.sizeLabel;
               fk.photocopies_single_id = single.id;
             }
           } else if (item.photocopies_set_id) {
-            const { data: set } = await supabaseAdmin
-              .from('photocopies_set')
-              .select('id, price_per_piece, size_label, copies_per_unit')
-              .eq('set_id', item.photocopies_set_id)
-              .single();
+            const set = await priceFromCatalogue(
+              schema.photocopiesSet,
+              schema.photocopiesSet.setId,
+              item.photocopies_set_id,
+              {
+                pricePerPiece: schema.photocopiesSet.pricePerPiece,
+                sizeLabel: schema.photocopiesSet.sizeLabel,
+                copiesPerUnit: schema.photocopiesSet.copiesPerUnit
+              }
+            );
             if (set) {
               // copies_per_unit is how many prints a unit yields, not a price multiplier.
-              unitPrice = parseFloat(set.price_per_piece);
-              itemDetails.size = set.size_label;
+              unitPrice = parseFloat(set.pricePerPiece);
+              itemDetails.size = set.sizeLabel;
               fk.photocopies_set_id = set.id;
             }
           }
@@ -207,14 +229,15 @@ export const createOrder = async (
 
         case 'Frames':
           if (item.frame_size_id) {
-            const { data: size } = await supabaseAdmin
-              .from('frame_sizes')
-              .select('id, price, size_label')
-              .eq('size_id', item.frame_size_id)
-              .single();
+            const size = await priceFromCatalogue(
+              schema.frameSizes,
+              schema.frameSizes.sizeId,
+              item.frame_size_id,
+              { price: schema.frameSizes.price, sizeLabel: schema.frameSizes.sizeLabel }
+            );
             if (size) {
               unitPrice = parseFloat(size.price);
-              itemDetails.size = size.size_label;
+              itemDetails.size = size.sizeLabel;
               fk.frame_size_id = size.id;
             }
           }
@@ -222,11 +245,12 @@ export const createOrder = async (
 
         case 'Album':
           if (item.album_capacity_id) {
-            const { data: album } = await supabaseAdmin
-              .from('album_capacities')
-              .select('id, price, label')
-              .eq('capacity_id', item.album_capacity_id)
-              .single();
+            const album = await priceFromCatalogue(
+              schema.albumCapacities,
+              schema.albumCapacities.capacityId,
+              item.album_capacity_id,
+              { price: schema.albumCapacities.price, label: schema.albumCapacities.label }
+            );
             if (album) {
               unitPrice = parseFloat(album.price);
               itemDetails.capacity = album.label;
@@ -237,11 +261,12 @@ export const createOrder = async (
 
         case 'SnapnPrint':
           if (item.snapnprint_package_id) {
-            const { data: pkg } = await supabaseAdmin
-              .from('snapnprint_packages')
-              .select('id, price, label')
-              .eq('package_id', item.snapnprint_package_id)
-              .single();
+            const pkg = await priceFromCatalogue(
+              schema.snapnprintPackages,
+              schema.snapnprintPackages.packageId,
+              item.snapnprint_package_id,
+              { price: schema.snapnprintPackages.price, label: schema.snapnprintPackages.label }
+            );
             if (pkg) {
               unitPrice = parseFloat(pkg.price);
               itemDetails.package = pkg.label;
@@ -296,107 +321,108 @@ export const createOrder = async (
     const randomSuffix = Math.floor(1000 + Math.random() * 9000);
     const orderNumber = `LOS-${dateStr}-${randomSuffix}`;
 
-    // Create order using ADMIN client
-    const { data: order, error: orderError } = await supabaseAdmin
-      .from('orders')
-      .insert({
-        user_id: finalUserId,
-        order_number: orderNumber,
-        service_type,
-        total_amount: totalAmount,
-        gift_wrap: gift_wrap || false,
-        gift_wrap_charge: giftWrapCharge,
-        delivery_charge: deliveryCharge,
-        customer_name,
-        customer_phone,
-        delivery_address,
-        address_house: address_house || null,
-        address_street: address_street || null,
-        address_landmark: address_landmark || null,
-        address_city: address_city || null,
-        address_state: address_state || null,
-        address_pincode: address_pincode || null,
-        event_date,
-        payment_status: 'pending',
-        order_status: 'pending'
-      })
-      .select()
-      .single();
+    // One transaction for the order, its items and the upload links. Supabase
+    // had no transactions over HTTP, so the old code inserted in three steps
+    // and hand-rolled compensating deletes when a later step failed. A real
+    // connection can just roll back, so a half-written order is impossible.
+    const order = await db.transaction(async (tx) => {
+      const [created] = await tx
+        .insert(schema.orders)
+        .values({
+          userId: finalUserId,
+          orderNumber,
+          serviceType: service_type,
+          // numeric columns take strings so no binary float ever touches money.
+          totalAmount: totalAmount.toFixed(2),
+          giftWrap: gift_wrap || false,
+          giftWrapCharge: giftWrapCharge.toFixed(2),
+          deliveryCharge: deliveryCharge.toFixed(2),
+          customerName: customer_name,
+          customerPhone: customer_phone,
+          deliveryAddress: delivery_address,
+          addressHouse: address_house || null,
+          addressStreet: address_street || null,
+          addressLandmark: address_landmark || null,
+          addressCity: address_city || null,
+          addressState: address_state || null,
+          addressPincode: address_pincode || null,
+          eventDate: event_date || null,
+          ipAddress,
+          paymentStatus: 'pending',
+          orderStatus: 'pending'
+        })
+        .returning();
 
-    if (orderError) {
-      logger.error('Failed to create order', { error: orderError.message });
-      throw new ApiError(500, `Failed to create order: ${orderError.message}`);
-    }
+      // Create order items
+      const orderItemRows = processedOrderItems.map((item: any) => ({
+        orderId: created.id,
+        passphotoPackId: item.passphoto_pack_id || null,
+        photocopiesSingleId: item.photocopies_single_id || null,
+        photocopiesSetId: item.photocopies_set_id || null,
+        frameSizeId: item.frame_size_id || null,
+        frameMaterial: item.frame_material || null,
+        albumCapacityId: item.album_capacity_id || null,
+        snapnprintPackageId: item.snapnprint_package_id || null,
+        // Legacy single-upload FK - kept pointing at the first image for
+        // backward compatibility with any code still reading it directly.
+        userUploadId: (item.upload_ids && item.upload_ids[0]) || item.user_upload_id || null,
+        quantity: item.quantity || 1,
+        unitPrice: (item.unit_price || 0).toFixed(2),
+        totalPrice: (item.total_price || 0).toFixed(2),
+        itemDetails: item.details || {}
+      }));
 
-    // Create order items
-    const orderItems = processedOrderItems.map((item: any) => ({
-      order_id: order.id,
-      passphoto_pack_id: item.passphoto_pack_id || null,
-      photocopies_single_id: item.photocopies_single_id || null,
-      photocopies_set_id: item.photocopies_set_id || null,
-      frame_size_id: item.frame_size_id || null,
-      frame_material: item.frame_material || null,
-      album_capacity_id: item.album_capacity_id || null,
-      snapnprint_package_id: item.snapnprint_package_id || null,
-      // Legacy single-upload FK — kept pointing at the first image for
-      // backward compatibility with any code still reading it directly.
-      user_upload_id: (item.upload_ids && item.upload_ids[0]) || item.user_upload_id || null,
-      quantity: item.quantity || 1,
-      unit_price: item.unit_price || 0,
-      total_price: item.total_price || 0,
-      item_details: item.details || {}
-    }));
+      // A single multi-row INSERT...RETURNING preserves input order, so the
+      // inserted rows line up with processedOrderItems by index.
+      const insertedItems = await tx
+        .insert(schema.orderItems)
+        .values(orderItemRows)
+        .returning({ id: schema.orderItems.id });
 
-    const { data: insertedItems, error: itemsError } = await supabaseAdmin
-      .from('order_items')
-      .insert(orderItems)
-      .select('id');
+      // Fan out every image into order_item_uploads, position-indexed per item.
+      const joinRows: {
+        orderItemId: string;
+        userUploadId: string;
+        position: number;
+      }[] = [];
 
-    if (itemsError || !insertedItems) {
-      logger.error('Failed to create order items', { error: itemsError?.message });
-      await supabaseAdmin.from('orders').delete().eq('id', order.id);
-      throw new ApiError(500, `Failed to create order items: ${itemsError?.message}`);
-    }
-
-    // Fan out every image into order_item_uploads, position-indexed per item.
-    // A single multi-row INSERT...RETURNING preserves input order, so the
-    // inserted rows line up with processedOrderItems by index.
-    const joinRows: { order_item_id: string; user_upload_id: string; position: number }[] = [];
-    processedOrderItems.forEach((item: any, idx: number) => {
-      const ids: string[] = item.upload_ids?.length ? item.upload_ids : (item.user_upload_id ? [item.user_upload_id] : []);
-      ids.forEach((uploadId: string, position: number) => {
-        joinRows.push({ order_item_id: insertedItems[idx].id, user_upload_id: uploadId, position });
+      processedOrderItems.forEach((item: any, idx: number) => {
+        const ids: string[] = item.upload_ids?.length
+          ? item.upload_ids
+          : (item.user_upload_id ? [item.user_upload_id] : []);
+        ids.forEach((uploadId: string, position: number) => {
+          joinRows.push({
+            orderItemId: insertedItems[idx].id,
+            userUploadId: uploadId,
+            position
+          });
+        });
       });
-    });
 
-    if (joinRows.length > 0) {
-      const { error: joinError } = await supabaseAdmin.from('order_item_uploads').insert(joinRows);
-      if (joinError) {
-        logger.error('Failed to link order item uploads', { error: joinError.message });
-        // order_items (ON DELETE CASCADE on order_id) and order_item_uploads
-        // (ON DELETE CASCADE on order_item_id) both clean up via this delete.
-        await supabaseAdmin.from('orders').delete().eq('id', order.id);
-        throw new ApiError(500, `Failed to link uploaded images: ${joinError.message}`);
+      if (joinRows.length > 0) {
+        await tx.insert(schema.orderItemUploads).values(joinRows);
       }
-    }
+
+      return created;
+    });
 
     logger.info('Order created successfully', {
       orderId: order.id,
-      orderNumber: order.order_number,
+      orderNumber: order.orderNumber,
       totalAmount
     });
 
     // Notifications
     const emailToNotify = req.user?.email;
     if (emailToNotify) {
-      emailService.sendOrderConfirmation(emailToNotify, order.order_number, totalAmount)
+      emailService.sendOrderConfirmation(emailToNotify, order.orderNumber, totalAmount)
         .catch(err => logger.error('Failed to send email', { err }));
     }
 
-    whatsappService.sendOrderConfirmation(customer_phone, order.order_number, customer_name)
+    whatsappService.sendOrderConfirmation(customer_phone, order.orderNumber, customer_name)
       .catch(err => logger.error('Failed to send customer WhatsApp', { err }));
 
-    whatsappService.notifyAdmin(order.order_number, customer_name, totalAmount)
+    whatsappService.notifyAdmin(order.orderNumber, customer_name, totalAmount)
       .catch(err => logger.error('Failed to notify admin via WhatsApp', { err }));
 
     res.status(201).json({
@@ -404,7 +430,7 @@ export const createOrder = async (
       message: 'Order created successfully',
       data: {
         order_id: order.id,
-        order_number: order.order_number,
+        order_number: order.orderNumber,
         subtotal,
         gift_wrap_charge: giftWrapCharge,
         delivery_charge: deliveryCharge,
@@ -440,28 +466,18 @@ export const getUserOrders = async (
     const offset = parseInt(req.query.offset as string) || 0;
     const status = req.query.status as string;
 
-    let query = supabaseAdmin
-      .from('orders')
-      .select('*, order_items(*, user_uploads(*), order_item_uploads(position, user_uploads(*)))')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .range(offset, offset + limit - 1);
-
-    if (status) {
-      query = query.eq('order_status', status);
-    }
-
-    const { data: orders, error } = await query;
-
-    if (error) {
-      logger.error('Failed to fetch orders', { error: error.message });
-      throw new ApiError(500, 'Failed to fetch orders');
-    }
+    const orders = await findOrders({
+      where: status
+        ? sql`o.user_id = ${userId} AND o.order_status = ${status}`
+        : sql`o.user_id = ${userId}`,
+      limit,
+      offset
+    });
 
     res.status(200).json({
       success: true,
-      count: orders?.length || 0,
-      data: sortItemUploads(orders)
+      count: orders.length,
+      data: orders
     });
 
   } catch (error) {
@@ -485,16 +501,11 @@ export const getAllOrders = async (
       throw new ApiError(403, 'Admin access required');
     }
 
-    const { data: orders, error } = await supabaseAdmin
-      .from('orders')
-      .select('*, order_items(*, user_uploads(*), order_item_uploads(position, user_uploads(*)))')
-      .order('created_at', { ascending: false });
-
-    if (error) throw new ApiError(500, 'Failed to fetch orders');
+    const orders = await findOrders({ where: sql`TRUE` });
 
     res.status(200).json({
       success: true,
-      data: sortItemUploads(orders)
+      data: orders
     });
 
   } catch (error) {
@@ -516,18 +527,16 @@ export const getOrderById = async (
     const userId = req.user?.id;
     const { id } = req.params;
 
-    const { data: order, error } = await supabaseAdmin
-      .from('orders')
-      .select('*, order_items(*, user_uploads(*), order_item_uploads(position, user_uploads(*)))')
-      .eq('id', id)
-      .eq('user_id', userId)
-      .single();
+    // Scoped to the caller. There is no row-level security behind this any
+    // more, so the user_id predicate is the only thing preventing one
+    // customer reading another's order.
+    const order = await findOrder(sql`o.id = ${id} AND o.user_id = ${userId}`);
 
-    if (error || !order) throw new ApiError(404, 'Order not found');
+    if (!order) throw new ApiError(404, 'Order not found');
 
     res.status(200).json({
       success: true,
-      data: sortItemUploads(order)
+      data: order
     });
 
   } catch (error) {
@@ -549,16 +558,13 @@ export const getOrderByNumber = async (
     const userId = req.user?.id;
     const { orderNumber } = req.params;
 
-    const { data: order, error } = await supabaseAdmin
-      .from('orders')
-      .select('*, order_items(*, user_uploads(*), order_item_uploads(position, user_uploads(*)))')
-      .eq('order_number', orderNumber)
-      .eq('user_id', userId)
-      .single();
+    const order = await findOrder(
+      sql`o.order_number = ${orderNumber} AND o.user_id = ${userId}`
+    );
 
-    if (error || !order) throw new ApiError(404, 'Order not found');
+    if (!order) throw new ApiError(404, 'Order not found');
 
-    res.status(200).json({ success: true, data: sortItemUploads(order) });
+    res.status(200).json({ success: true, data: order });
   } catch (error) {
     next(error);
   }
@@ -578,20 +584,31 @@ export const cancelOrder = async (
     const userId = req.user?.id;
     const { id } = req.params;
 
-    const { data: order } = await supabaseAdmin
-      .from('orders')
-      .select('order_status')
-      .eq('id', id)
-      .eq('user_id', userId)
-      .single();
+    if (!userId) throw new ApiError(401, 'Authentication required');
 
-    if (!order) throw new ApiError(404, 'Order not found');
-    if (order.order_status !== 'pending') throw new ApiError(400, 'Only pending orders can be cancelled');
+    // Cancel only if it is still pending AND still owned by the caller, in one
+    // statement: a check-then-update could race a payment landing in between.
+    const cancelled = await db
+      .update(schema.orders)
+      .set({ orderStatus: 'cancelled' })
+      .where(and(
+        eq(schema.orders.id, id),
+        eq(schema.orders.userId, userId),
+        eq(schema.orders.orderStatus, 'pending')
+      ))
+      .returning({ id: schema.orders.id });
 
-    await supabaseAdmin
-      .from('orders')
-      .update({ order_status: 'cancelled' })
-      .eq('id', id);
+    if (cancelled.length === 0) {
+      // Distinguish "not yours / no such order" from "no longer cancellable".
+      const [existing] = await db
+        .select({ orderStatus: schema.orders.orderStatus })
+        .from(schema.orders)
+        .where(and(eq(schema.orders.id, id), eq(schema.orders.userId, userId)))
+        .limit(1);
+
+      if (!existing) throw new ApiError(404, 'Order not found');
+      throw new ApiError(400, 'Only pending orders can be cancelled');
+    }
 
     res.status(200).json({
       success: true,
@@ -619,14 +636,25 @@ export const updateOrderStatus = async (
     const { id } = req.params;
     const { order_status, payment_status } = req.body;
 
-    await supabaseAdmin
-      .from('orders')
-      .update({ 
-        order_status, 
-        payment_status,
-        updated_at: new Date().toISOString() 
-      })
-      .eq('id', id);
+    // Only write the fields actually supplied. The previous version always set
+    // both, so sending just order_status would null out payment_status.
+    const changes: Record<string, unknown> = {};
+    if (order_status !== undefined) changes.orderStatus = order_status;
+    if (payment_status !== undefined) changes.paymentStatus = payment_status;
+
+    if (Object.keys(changes).length === 0) {
+      throw new ApiError(400, 'Nothing to update');
+    }
+
+    const updated = await db
+      .update(schema.orders)
+      .set(changes)
+      .where(eq(schema.orders.id, id))
+      .returning({ id: schema.orders.id });
+
+    if (updated.length === 0) {
+      throw new ApiError(404, 'Order not found');
+    }
 
     res.status(200).json({
       success: true,
@@ -654,10 +682,17 @@ export const getAdminStats = async (
     const { startDate, endDate } = req.query;
 
     // Only count 'delivered' orders for income
-    const { data: orders } = await supabaseAdmin
-      .from('orders')
-      .select('id, service_type, total_amount, delivery_charge, gift_wrap_charge, created_at')
-      .eq('order_status', 'delivered');
+    const orders = await db
+      .select({
+        id: schema.orders.id,
+        service_type: schema.orders.serviceType,
+        total_amount: schema.orders.totalAmount,
+        delivery_charge: schema.orders.deliveryCharge,
+        gift_wrap_charge: schema.orders.giftWrapCharge,
+        created_at: schema.orders.createdAt
+      })
+      .from(schema.orders)
+      .where(eq(schema.orders.orderStatus, 'delivered'));
 
     const now = new Date();
     const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -742,21 +777,29 @@ export const getBookedSlots = async (
   next: NextFunction
 ) => {
   try {
-    const { data: orders } = await supabaseAdmin
-      .from('orders')
-      .select('event_date, order_items(item_details)')
-      .eq('service_type', 'Snap n\' Print')
-      .neq('order_status', 'cancelled')
-      .not('event_date', 'is', null);
+    // service_type is 'SnapnPrint'. The previous query filtered on
+    // "Snap n' Print", which the valid_service CHECK constraint does not
+    // permit, so this endpoint could only ever return an empty object.
+    const rows = await db
+      .select({
+        eventDate: schema.orders.eventDate,
+        itemDetails: schema.orderItems.itemDetails
+      })
+      .from(schema.orders)
+      .leftJoin(schema.orderItems, eq(schema.orderItems.orderId, schema.orders.id))
+      .where(and(
+        eq(schema.orders.serviceType, 'SnapnPrint'),
+        ne(schema.orders.orderStatus, 'cancelled'),
+        isNotNull(schema.orders.eventDate)
+      ));
 
     const bookedSlots: Record<string, string[]> = {};
-    orders?.forEach((o: any) => {
-      const date = o.event_date;
+    rows.forEach((row) => {
+      const date = row.eventDate as string;
+      if (!date) return;
       if (!bookedSlots[date]) bookedSlots[date] = [];
-      o.order_items?.forEach((i: any) => {
-        const window = i.item_details?.['Arrival Window'];
-        if (window) bookedSlots[date].push(window);
-      });
+      const window = (row.itemDetails as any)?.['Arrival Window'];
+      if (window) bookedSlots[date].push(window);
     });
 
     res.status(200).json({ success: true, data: bookedSlots });
@@ -790,32 +833,22 @@ export const submitFeedback = async (
 
     logger.info('Submitting feedback for order', { orderNumber, userId, rating });
 
-    // Validate that order belongs to user
-    const { data: order, error: orderError } = await supabaseAdmin
-      .from('orders')
-      .select('id, user_id')
-      .eq('order_number', orderNumber)
-      .eq('user_id', userId)
-      .single();
-
-    if (orderError || !order) {
-      throw new ApiError(404, 'Order not found or unauthorized');
-    }
-
-    // Update feedback directly into the orders table
-    // (Requires feedback_rating and feedback_comment columns)
-    const { error: updateError } = await supabaseAdmin
-      .from('orders')
-      .update({
-        feedback_rating: rating,
-        feedback_comment: comment || null
+    // Ownership is enforced in the UPDATE's predicate, so there is no
+    // separate lookup and no window between the check and the write.
+    const updated = await db
+      .update(schema.orders)
+      .set({
+        feedbackRating: rating,
+        feedbackComment: comment || null
       })
-      .eq('order_number', orderNumber)
-      .eq('user_id', userId);
+      .where(and(
+        eq(schema.orders.orderNumber, orderNumber),
+        eq(schema.orders.userId, userId)
+      ))
+      .returning({ id: schema.orders.id });
 
-    if (updateError) {
-      logger.error('Failed to save feedback to DB', { error: updateError });
-      throw new ApiError(500, 'Failed to save feedback');
+    if (updated.length === 0) {
+      throw new ApiError(404, 'Order not found or unauthorized');
     }
 
     res.status(200).json({

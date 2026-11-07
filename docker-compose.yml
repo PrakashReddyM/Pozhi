@@ -24,9 +24,11 @@ services:
       # Matches the collation the app's text comparisons assume.
       POSTGRES_INITDB_ARGS: "--encoding=UTF8"
     ports:
-      # Host 5432 -> container 5432. If something already owns 5432 on your
-      # machine, change the left-hand number and your DATABASE_URL to match.
-      - "5432:5432"
+      # Host 5433 -> container 5432.
+      # NOT 5432: this machine already runs a native PostgreSQL 18 Windows
+      # service (postgresql-x64-18) bound to 0.0.0.0:5432, which shadows a
+      # published 5432 and makes host connections hit the wrong server.
+      - "5433:5432"
     volumes:
       - pozhi_pgdata:/var/lib/postgresql/data
       # Every .sql here runs once, in filename order, when the volume is first

@@ -11,7 +11,23 @@ const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PAYMENT_MODE: z.enum(['mock', 'stripe', 'razorpay']).default('mock'),
 
-  // Supabase
+  // PostgreSQL (replaces Supabase)
+  DATABASE_URL: z.string().url('Invalid DATABASE_URL (postgresql://user:pass@host:port/db)'),
+  DATABASE_SSL: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
+
+  // Self-issued sessions (replaces Supabase Auth)
+  JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
+  JWT_REFRESH_SECRET: z.string().min(32, 'JWT_REFRESH_SECRET must be at least 32 characters'),
+  JWT_ACCESS_TTL: z.string().default('15m'),
+  JWT_REFRESH_TTL_DAYS: z.coerce.number().int().positive().default(30),
+
+  // Google OAuth - these used to live in the Supabase dashboard.
+  // Sign-in with Google is disabled while they are unset.
+  GOOGLE_CLIENT_ID: z.string().optional(),
+  GOOGLE_CLIENT_SECRET: z.string().optional(),
+
+  // Supabase - still required while the migration is in progress.
+  // TODO(migration): drop these once no module imports config/supabase.
   SUPABASE_URL: z.string().url('Invalid Supabase URL'),
   SUPABASE_ANON_KEY: z.string().min(20, 'Supabase anon key required'),
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(20, 'Supabase service role key required'),
@@ -78,6 +94,9 @@ if (!_env.success) {
   // Exit process to prevent server from starting in an unstable state
   process.exit(1);
 }
+export const isGoogleOAuthConfigured = (): boolean =>
+  !!(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET);
+
 export const isStripeLiveMode = (): boolean => {
   return env.STRIPE_SECRET_KEY?.startsWith('sk_live_') ?? false;
 };

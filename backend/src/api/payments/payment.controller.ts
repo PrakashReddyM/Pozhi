@@ -2,7 +2,8 @@ import { Request, Response, NextFunction } from 'express';
 import { createPaymentOrder, verifyPaymentSignature, handlePaymentSuccess } from '../../services/payment.service';
 import { ApiError } from '../../utils/ApiError';
 import { logger } from '../../utils/logger';
-import { supabaseAdmin } from '../../config/supabase';
+import { and, eq } from 'drizzle-orm';
+import { db, schema } from '../../db';
 
 export async function createPaymentIntent(req: Request, res: Response, next: NextFunction) {
   try {
@@ -25,29 +26,33 @@ export async function verifyPayment(req: Request, res: Response, next: NextFunct
 
     // The order must belong to the caller. Without this, any signed-in user could
     // settle someone else's order.
-    const { data: order, error: lookupError } = await supabaseAdmin
-      .from('orders')
-      .select('id, user_id, payment_status, upi_transaction_id')
-      .eq('id', orderId)
-      .eq('user_id', userId)
-      .single();
+    const [order] = await db
+      .select({
+        id: schema.orders.id,
+        userId: schema.orders.userId,
+        paymentStatus: schema.orders.paymentStatus,
+        upiTransactionId: schema.orders.upiTransactionId
+      })
+      .from(schema.orders)
+      .where(and(eq(schema.orders.id, orderId), eq(schema.orders.userId, userId)))
+      .limit(1);
 
-    if (lookupError || !order) {
+    if (!order) {
       throw new ApiError(404, 'Order not found');
     }
 
-    if (order.payment_status === 'completed') {
+    if (order.paymentStatus === 'completed') {
       return res.status(200).json({ status: 'success', data: { message: 'Payment already verified' } });
     }
 
     // The signature only proves Razorpay issued this payment — it says nothing about
     // WHICH of our orders it belongs to. Bind it to the Razorpay order we created for
     // this order, otherwise one valid payment could settle any number of orders.
-    if (!order.upi_transaction_id || order.upi_transaction_id !== razorpayOrderId) {
+    if (!order.upiTransactionId || order.upiTransactionId !== razorpayOrderId) {
       logger.warn('Payment verification rejected: razorpay order mismatch', {
         orderId,
         userId,
-        expected: order.upi_transaction_id,
+        expected: order.upiTransactionId,
         received: razorpayOrderId
       });
       throw new ApiError(400, 'Payment verification failed: this payment does not belong to this order');

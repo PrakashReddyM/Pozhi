@@ -44,7 +44,7 @@ const AdminLogin = () => {
     setGoogleLoading(true);
     setError(null);
     try {
-      await completeGoogleLogin(code);
+      await completeGoogleLogin(code, `${window.location.origin}/login`);
       navigate('/', { replace: true });
     } catch (err: any) {
       setError(err.message || "Google login failed");

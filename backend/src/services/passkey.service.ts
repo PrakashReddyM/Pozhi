@@ -1,21 +1,26 @@
 // ==========================================
 // PASSKEY SERVICE - WebAuthn/FIDO2 Server Logic
+//
+// Migrated from Supabase to local PostgreSQL + Drizzle.
+// Session issuance now uses token.service instead of the Supabase Auth Admin SDK.
 // ==========================================
 
 import {
   generateRegistrationOptions,
   verifyRegistrationResponse,
   generateAuthenticationOptions,
-  verifyAuthenticationResponse,
+  verifyAuthenticationResponse
 } from '@simplewebauthn/server';
 import type {
   RegistrationResponseJSON,
   AuthenticationResponseJSON,
-  AuthenticatorTransportFuture,
+  AuthenticatorTransportFuture
 } from '@simplewebauthn/server';
+import { and, desc, eq } from 'drizzle-orm';
+import { db, schema } from '../db';
 import { env } from '../config/env';
-import { supabaseAdmin } from '../config/supabase';
 import { cacheService } from './cache.service';
+import { issueSession } from './token.service';
 import { logger } from '../utils/logger';
 import { ApiError } from '../utils/ApiError';
 import crypto from 'crypto';
@@ -28,76 +33,55 @@ const rpName = env.WEBAUTHN_RP_NAME;
 const rpID = env.WEBAUTHN_RP_ID;
 const origin = env.WEBAUTHN_ORIGIN;
 
-const CHALLENGE_TTL = 300; // 5 minutes
-
-// ==========================================
-// TYPES
-// ==========================================
-
-interface StoredCredential {
-  id: string;
-  user_id: string;
-  credential_id: string;
-  public_key: string;
-  counter: number;
-  transports: string[] | null;
-  device_type: string;
-  backed_up: boolean;
-  aaguid: string | null;
-  friendly_name: string;
-  last_used_at: string | null;
-  created_at: string;
-}
+const CHALLENGE_TTL = 300; // 5 minutes in Redis
 
 // ==========================================
 // REGISTRATION
 // ==========================================
 
 /**
- * Generate registration options for a user to create a new passkey
+ * Generate registration options for the user to create a new passkey.
  */
 export async function getRegistrationOptions(
   userId: string,
   userEmail: string,
   friendlyName: string = 'My Passkey'
 ) {
-  // Fetch existing credentials to exclude (prevent re-registration)
-  const existingCredentials = await getUserCredentials(userId);
+  const existingCredentials = await _getUserCredentials(userId);
 
   const options = await generateRegistrationOptions({
     rpName,
     rpID,
     userName: userEmail,
     userDisplayName: userEmail.split('@')[0],
-    attestationType: 'none', // We don't need attestation for passkeys
+    attestationType: 'none',
     excludeCredentials: existingCredentials.map((cred) => ({
-      id: cred.credential_id,
-      transports: (cred.transports as AuthenticatorTransportFuture[]) || [],
+      id: cred.credentialId,
+      transports: (cred.transports as AuthenticatorTransportFuture[]) || []
     })),
     authenticatorSelection: {
       residentKey: 'preferred',
-      userVerification: 'preferred',
-    },
+      userVerification: 'preferred'
+    }
   });
 
   // Store challenge in Redis (single-use, 5 min TTL)
   const challengeKey = `passkey:challenge:reg:${userId}`;
   await cacheService.set(challengeKey, JSON.stringify({
     challenge: options.challenge,
-    friendly_name: friendlyName,
+    friendly_name: friendlyName
   }), CHALLENGE_TTL);
 
   return options;
 }
 
 /**
- * Verify registration response and store credential in database
+ * Verify registration response and persist the new credential.
  */
 export async function verifyRegistration(
   userId: string,
   credential: RegistrationResponseJSON
 ) {
-  // Retrieve and delete challenge (single-use)
   const challengeKey = `passkey:challenge:reg:${userId}`;
   const challengeData = await cacheService.get(challengeKey);
 
@@ -105,7 +89,6 @@ export async function verifyRegistration(
     throw new ApiError(400, 'Registration challenge expired or not found. Please try again.');
   }
 
-  // Delete immediately to prevent replay
   await cacheService.del(challengeKey);
 
   const { challenge, friendly_name } = JSON.parse(challengeData);
@@ -114,7 +97,7 @@ export async function verifyRegistration(
     response: credential,
     expectedChallenge: challenge,
     expectedOrigin: origin,
-    expectedRPID: rpID,
+    expectedRPID: rpID
   });
 
   if (!verification.verified || !verification.registrationInfo) {
@@ -124,30 +107,22 @@ export async function verifyRegistration(
   const { credential: regCredential, credentialDeviceType, credentialBackedUp } =
     verification.registrationInfo;
 
-  // Store credential in database
-  const { error } = await supabaseAdmin
-    .from('passkey_credentials')
-    .insert({
-      user_id: userId,
-      credential_id: regCredential.id,
-      public_key: Buffer.from(regCredential.publicKey).toString('base64url'),
-      counter: regCredential.counter,
-      transports: credential.response.transports || [],
-      device_type: credentialDeviceType,
-      backed_up: credentialBackedUp,
-      aaguid: verification.registrationInfo.aaguid,
-      friendly_name: friendly_name || 'My Passkey',
-    });
-
-  if (error) {
-    logger.error('Failed to store passkey credential', { error: error.message, userId });
-    throw new ApiError(500, 'Failed to save passkey. Please try again.');
-  }
+  await db.insert(schema.passkeyCredentials).values({
+    userId,
+    credentialId: regCredential.id,
+    publicKey: Buffer.from(regCredential.publicKey).toString('base64url'),
+    counter: regCredential.counter,
+    transports: credential.response.transports ?? [],
+    deviceType: credentialDeviceType,
+    backedUp: credentialBackedUp,
+    aaguid: verification.registrationInfo.aaguid ?? null,
+    friendlyName: friendly_name || 'My Passkey'
+  });
 
   return {
     verified: true,
     deviceType: credentialDeviceType,
-    backedUp: credentialBackedUp,
+    backedUp: credentialBackedUp
   };
 }
 
@@ -156,40 +131,35 @@ export async function verifyRegistration(
 // ==========================================
 
 /**
- * Generate authentication options (login challenge)
+ * Generate authentication options (login challenge).
  */
 export async function getAuthenticationOptions(email?: string) {
   let allowCredentials: { id: string; transports?: AuthenticatorTransportFuture[] }[] = [];
 
   if (email) {
-    // Look up user by email to get their credentials
-    const { data: profile } = await supabaseAdmin
-      .from('profiles')
-      .select('id')
-      .eq('email', email.toLowerCase())
-      .single();
+    const [profile] = await db
+      .select({ id: schema.profiles.id })
+      .from(schema.profiles)
+      .where(eq(schema.profiles.email, email.toLowerCase()))
+      .limit(1);
 
     if (profile) {
-      const credentials = await getUserCredentials(profile.id);
+      const credentials = await _getUserCredentials(profile.id);
       allowCredentials = credentials.map((cred) => ({
-        id: cred.credential_id,
-        transports: (cred.transports as AuthenticatorTransportFuture[]) || [],
+        id: cred.credentialId,
+        transports: (cred.transports as AuthenticatorTransportFuture[]) || []
       }));
     }
-    // If no profile found, we still return options (discoverable credential flow)
-    // Don't reveal whether email exists
+    // Don't 404 if email doesn't exist — don't reveal account enumeration.
   }
 
   const options = await generateAuthenticationOptions({
     rpID,
     allowCredentials,
-    userVerification: 'preferred',
+    userVerification: 'preferred'
   });
 
-  // Generate unique challenge ID
   const challengeId = crypto.randomUUID();
-
-  // Store challenge in Redis
   const challengeKey = `passkey:challenge:auth:${challengeId}`;
   await cacheService.set(challengeKey, options.challenge, CHALLENGE_TTL);
 
@@ -197,13 +167,13 @@ export async function getAuthenticationOptions(email?: string) {
 }
 
 /**
- * Verify authentication response and return user session
+ * Verify authentication response and return a new session.
  */
 export async function verifyAuthentication(
   challengeId: string,
-  credential: AuthenticationResponseJSON
+  credential: AuthenticationResponseJSON,
+  context: { userAgent?: string; ipAddress?: string } = {}
 ) {
-  // Retrieve and delete challenge (single-use)
   const challengeKey = `passkey:challenge:auth:${challengeId}`;
   const expectedChallenge = await cacheService.get(challengeKey);
 
@@ -211,22 +181,19 @@ export async function verifyAuthentication(
     throw new ApiError(400, 'Authentication challenge expired or not found. Please try again.');
   }
 
-  // Delete immediately to prevent replay
   await cacheService.del(challengeKey);
 
-  // Look up credential in database
-  const { data: storedCred, error: lookupError } = await supabaseAdmin
-    .from('passkey_credentials')
-    .select('*')
-    .eq('credential_id', credential.id)
-    .single();
+  const [storedCred] = await db
+    .select()
+    .from(schema.passkeyCredentials)
+    .where(eq(schema.passkeyCredentials.credentialId, credential.id))
+    .limit(1);
 
-  if (lookupError || !storedCred) {
-    throw new ApiError(401, 'Passkey not recognized. Please register a passkey first.');
+  if (!storedCred) {
+    throw new ApiError(401, 'Passkey not recognised. Please register a passkey first.');
   }
 
-  // Reconstruct public key from base64url
-  const publicKeyBytes = Buffer.from(storedCred.public_key, 'base64url');
+  const publicKeyBytes = Buffer.from(storedCred.publicKey, 'base64url');
 
   const verification = await verifyAuthenticationResponse({
     response: credential,
@@ -234,105 +201,83 @@ export async function verifyAuthentication(
     expectedOrigin: origin,
     expectedRPID: rpID,
     credential: {
-      id: storedCred.credential_id,
+      id: storedCred.credentialId,
       publicKey: new Uint8Array(publicKeyBytes),
       counter: storedCred.counter,
-      transports: (storedCred.transports as AuthenticatorTransportFuture[]) || [],
-    },
+      transports: (storedCred.transports as AuthenticatorTransportFuture[]) || []
+    }
   });
 
   if (!verification.verified) {
     throw new ApiError(401, 'Passkey authentication failed.');
   }
 
-  // Counter validation (clone detection)
+  // Counter check — a non-incrementing counter signals a possible cloned authenticator.
   const newCounter = verification.authenticationInfo.newCounter;
   if (newCounter > 0 && newCounter <= storedCred.counter) {
-    logger.warn('Passkey counter did not increment - possible clone detected', {
-      userId: storedCred.user_id,
-      credentialId: storedCred.credential_id,
+    logger.warn('Passkey counter did not increment — possible clone detected', {
+      userId: storedCred.userId,
+      credentialId: storedCred.credentialId,
       storedCounter: storedCred.counter,
-      newCounter,
+      newCounter
     });
     throw new ApiError(403, 'Authentication failed: security check failed.');
   }
 
-  // Update counter and last_used_at
-  await supabaseAdmin
-    .from('passkey_credentials')
-    .update({
-      counter: newCounter,
-      last_used_at: new Date().toISOString(),
+  // Update counter and last-used timestamp.
+  await db
+    .update(schema.passkeyCredentials)
+    .set({ counter: newCounter, lastUsedAt: new Date().toISOString() })
+    .where(eq(schema.passkeyCredentials.id, storedCred.id));
+
+  const [profile] = await db
+    .select({
+      id: schema.profiles.id,
+      email: schema.profiles.email,
+      fullName: schema.profiles.fullName,
+      role: schema.profiles.role,
+      isBanned: schema.profiles.isBanned,
+      isActive: schema.profiles.isActive
     })
-    .eq('id', storedCred.id);
+    .from(schema.profiles)
+    .where(eq(schema.profiles.id, storedCred.userId))
+    .limit(1);
 
-  // Get user profile
-  const { data: profile, error: profileError } = await supabaseAdmin
-    .from('profiles')
-    .select('id, email, full_name, role, is_banned')
-    .eq('id', storedCred.user_id)
-    .single();
-
-  if (profileError || !profile) {
+  if (!profile) {
     throw new ApiError(500, 'Failed to retrieve user profile.');
   }
 
-  if (profile.is_banned) {
+  if (profile.isBanned) {
     throw new ApiError(403, 'Your account has been suspended. Contact support.');
   }
 
-  // Generate a Supabase session for the user via admin magic link
-  const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.generateLink({
-    type: 'magiclink',
-    email: profile.email,
-  });
-
-  if (linkError || !linkData) {
-    logger.error('Failed to generate session for passkey login', {
-      error: linkError?.message,
-      userId: profile.id,
-    });
-    throw new ApiError(500, 'Failed to create session. Please try again.');
+  if (profile.isActive === false) {
+    throw new ApiError(403, 'Your account is inactive. Contact support.');
   }
 
-  // Extract the token hash and verify it to get a real session
-  const tokenHash = linkData.properties?.hashed_token;
+  // Record last login.
+  await db
+    .update(schema.profiles)
+    .set({ lastLoginAt: new Date().toISOString() })
+    .where(eq(schema.profiles.id, profile.id));
 
-  if (!tokenHash) {
-    throw new ApiError(500, 'Failed to create session token.');
-  }
-
-  const { data: sessionData, error: sessionError } = await supabaseAdmin.auth.verifyOtp({
-    token_hash: tokenHash,
-    type: 'magiclink',
-  });
-
-  if (sessionError || !sessionData.session) {
-    logger.error('Failed to verify OTP for passkey session', {
-      error: sessionError?.message,
-      userId: profile.id,
-    });
-    throw new ApiError(500, 'Failed to establish session. Please try again.');
-  }
-
-  // Update last login
-  await supabaseAdmin
-    .from('profiles')
-    .update({ last_login_at: new Date().toISOString() })
-    .eq('id', profile.id);
+  const session = await issueSession(
+    { id: profile.id, email: profile.email, role: profile.role },
+    context
+  );
 
   return {
     user: {
       id: profile.id,
       email: profile.email,
-      full_name: profile.full_name,
-      role: profile.role,
+      full_name: profile.fullName,
+      role: profile.role
     },
     session: {
-      access_token: sessionData.session.access_token,
-      refresh_token: sessionData.session.refresh_token,
-      expires_at: sessionData.session.expires_at,
-    },
+      access_token: session.accessToken,
+      refresh_token: session.refreshToken,
+      expires_at: session.expiresAt
+    }
   };
 }
 
@@ -341,36 +286,37 @@ export async function verifyAuthentication(
 // ==========================================
 
 /**
- * Get all passkey credentials for a user
+ * List all passkeys for a user (public fields only).
  */
 export async function getUserPasskeys(userId: string) {
-  const { data, error } = await supabaseAdmin
-    .from('passkey_credentials')
-    .select('id, friendly_name, device_type, backed_up, transports, last_used_at, created_at')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false });
-
-  if (error) {
-    logger.error('Failed to fetch passkeys', { error: error.message, userId });
-    throw new ApiError(500, 'Failed to retrieve passkeys.');
-  }
-
-  return data || [];
+  return db
+    .select({
+      id: schema.passkeyCredentials.id,
+      friendlyName: schema.passkeyCredentials.friendlyName,
+      deviceType: schema.passkeyCredentials.deviceType,
+      backedUp: schema.passkeyCredentials.backedUp,
+      transports: schema.passkeyCredentials.transports,
+      lastUsedAt: schema.passkeyCredentials.lastUsedAt,
+      createdAt: schema.passkeyCredentials.createdAt
+    })
+    .from(schema.passkeyCredentials)
+    .where(eq(schema.passkeyCredentials.userId, userId))
+    .orderBy(desc(schema.passkeyCredentials.createdAt));
 }
 
 /**
- * Delete a passkey credential
+ * Delete a passkey credential.
  */
 export async function deletePasskey(userId: string, passkeyId: string) {
-  const { data, error } = await supabaseAdmin
-    .from('passkey_credentials')
-    .delete()
-    .eq('id', passkeyId)
-    .eq('user_id', userId)
-    .select('id')
-    .single();
+  const [deleted] = await db
+    .delete(schema.passkeyCredentials)
+    .where(and(
+      eq(schema.passkeyCredentials.id, passkeyId),
+      eq(schema.passkeyCredentials.userId, userId)
+    ))
+    .returning({ id: schema.passkeyCredentials.id });
 
-  if (error || !data) {
+  if (!deleted) {
     throw new ApiError(404, 'Passkey not found or already deleted.');
   }
 
@@ -378,38 +324,35 @@ export async function deletePasskey(userId: string, passkeyId: string) {
 }
 
 /**
- * Rename a passkey
+ * Rename a passkey's friendly name.
  */
 export async function renamePasskey(userId: string, passkeyId: string, newName: string) {
-  const { data, error } = await supabaseAdmin
-    .from('passkey_credentials')
-    .update({ friendly_name: newName })
-    .eq('id', passkeyId)
-    .eq('user_id', userId)
-    .select('id, friendly_name')
-    .single();
+  const [updated] = await db
+    .update(schema.passkeyCredentials)
+    .set({ friendlyName: newName })
+    .where(and(
+      eq(schema.passkeyCredentials.id, passkeyId),
+      eq(schema.passkeyCredentials.userId, userId)
+    ))
+    .returning({
+      id: schema.passkeyCredentials.id,
+      friendlyName: schema.passkeyCredentials.friendlyName
+    });
 
-  if (error || !data) {
+  if (!updated) {
     throw new ApiError(404, 'Passkey not found.');
   }
 
-  return data;
+  return updated;
 }
 
 // ==========================================
 // INTERNAL HELPERS
 // ==========================================
 
-async function getUserCredentials(userId: string): Promise<StoredCredential[]> {
-  const { data, error } = await supabaseAdmin
-    .from('passkey_credentials')
-    .select('*')
-    .eq('user_id', userId);
-
-  if (error) {
-    logger.error('Failed to fetch credentials', { error: error.message, userId });
-    return [];
-  }
-
-  return data || [];
+async function _getUserCredentials(userId: string) {
+  return db
+    .select()
+    .from(schema.passkeyCredentials)
+    .where(eq(schema.passkeyCredentials.userId, userId));
 }
